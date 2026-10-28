@@ -6,12 +6,11 @@ import {
   cancelScanLogs,
   deleteLogs,
   formatSize,
-  listDisks,
   buildScopeOptions,
   getLocal,
   setLocal,
   getCachedDisks,
-  setCachedDisks,
+  ensureDisksLoaded,
   type LogItem,
   type DiskInfo,
 } from "../api/electron";
@@ -48,6 +47,8 @@ const confirming = ref(false);
 /** 清理完成提示对话框（重新扫描 / 暂不） */
 const showDone = ref(false);
 const minDays = ref(0);
+/** 已扫描（遍历）文件总数：由后端进度回调驱动，用于展示扫描在快速推进 */
+const enumerated = ref(0);
 
 /** 扫描范围：'C'/'D'…=指定盘符；'all'=全部盘符。默认系统盘，已持久化记忆。 */
 const scope = ref(getLocal(SCOPE_KEY) || "");
@@ -64,9 +65,7 @@ watch(scope, (v) => setLocal(SCOPE_KEY, v));
 
 onMounted(async () => {
   try {
-    const list = await listDisks();
-    disks.value = list;
-    setCachedDisks(list);
+    disks.value = await ensureDisksLoaded();
   } catch {
     /* 保留缓存值 */
   }
@@ -118,13 +117,22 @@ async function doScan() {
   confirming.value = false;
   items.value = [];
   selected.value = {};
+  enumerated.value = 0;
   try {
-    const all = await scanLogs(minDays.value, scope.value, (it) => {
-      items.value.unshift(it);
-      if (GROUPS.find((g) => g.key === it.group)?.recommend) {
-        selected.value[it.id] = true;
-      }
-    });
+    const all = await scanLogs(
+      minDays.value,
+      scope.value,
+      (it) => {
+        items.value.unshift(it);
+        if (GROUPS.find((g) => g.key === it.group)?.recommend) {
+          selected.value[it.id] = true;
+        }
+      },
+      (n) => {
+        // 后端回推的「已遍历文件总数」，平滑跳动，避免看起来像没扫描
+        enumerated.value = n;
+      },
+    );
     items.value = all;
     selected.value = {};
     for (const it of all) {
@@ -208,11 +216,7 @@ function doneRescan() {
         <label class="lbl">仅列出</label>
         <input v-model.number="minDays" class="num" type="number" min="0" />
         <span class="muted">天前的文件（0 = 不限）</span>
-        <span v-if="loading" class="muted">
-          <span class="spinner"></span>
-          扫描中… 已发现 {{ items.length }} 项
-        </span>
-        <span class="muted" v-else-if="items.length">
+        <span class="muted" v-if="items.length">
           共 {{ items.length }} 项 · {{ formatSize(totalBytes) }}
         </span>
         <LastScan module="logs" />
@@ -277,7 +281,7 @@ function doneRescan() {
         :desc="emptyDesc"
       />
 
-      <div v-if="items.length" class="actions">
+      <div v-if="loading || items.length" class="actions">
         <button
           class="btn"
           :class="confirming ? 'btn-danger' : 'btn-primary'"
@@ -292,6 +296,9 @@ function doneRescan() {
           </template>
         </button>
         <span class="muted">默认移入回收站；崩溃转储默认不勾，需自行确认。</span>
+        <span class="muted actions-stat">
+          已扫描 {{ enumerated }} 个文件，{{ items.length }} 项结果
+        </span>
       </div>
     </div>
 
@@ -411,6 +418,12 @@ function doneRescan() {
   gap: 12px;
   margin-top: 16px;
   flex-wrap: wrap;
+}
+/* 扫描统计：推到卡片右下方（清理按钮之后、行末） */
+.actions-stat {
+  margin-left: auto;
+  font-size: calc(12px * var(--fs-scale));
+  white-space: nowrap;
 }
 .err {
   color: var(--danger);

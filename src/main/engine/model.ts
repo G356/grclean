@@ -119,6 +119,10 @@ export interface UninstallEntry {
   version: string;
   publisher: string;
   install_location: string;
+  /** 安装日期（InstallDate 归一化后的 YYYY-MM-DD，取不到则为空串） */
+  install_date: string;
+  /** 程序图标（data URL；取不到则为空串，前端显示占位图标） */
+  icon: string;
   size_kb: number;
   uninstall_string: string;
   quiet_uninstall_string: string;
@@ -151,4 +155,6 @@ export interface CleanResult {
   deleted_size: number;
   skipped: SkippedItem[];
   errors: string[];
+  /** 附加说明（如「回收站不可用，已改为直接删除」）。可选，仅部分模块填充。 */
+  notes?: string[];
 }

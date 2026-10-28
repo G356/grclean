@@ -3,6 +3,10 @@ import fs from 'fs'
 import { type BigFileEntry } from './model'
 
 const BATCH = 40
+// 并发 stat 上限：消除旧版逐文件串行 fs.statSync 的瓶颈（事件循环被阻塞）。
+// 注意：fast-glob 的 walkStream 在「盘根目录 + stats:true」下不产出（@nodelib/fs.walk 已知问题），
+// 因此这里改用 walkStream 不带 stats（盘根可正常递归）+ 并发异步 stat 取体积。
+const STAT_CONC = 64
 
 // 常见用户数据目录：英文 + 中文（适配中文 Windows）各取首个存在的
 const USER_FOLDER_CANDIDATES: Record<string, string[]> = {
@@ -52,6 +56,8 @@ export interface BigFileScanOpts {
   includeAll: boolean
   /** 指定单个盘符（如 'D'）时只扫描该盘根目录，优先级高于 includeAll */
   drive?: string
+  /** 遍历进度回调：每累积一定文件数回推「已遍历文件总数」（含未达阈值的文件），用于前端展示扫描进度 */
+  onScanned?: (total: number) => void
 }
 
 /**
@@ -71,11 +77,15 @@ export async function* scanBigFilesStream(
       ? allDrives()
       : userDirs()
   const minBytes = Math.max(opts.minSize, 1)
+  // 跨盘根累计的遍历总数（含未达阈值的文件），用于向前端回推扫描进度。
+  let scannedTotal = 0
 
   for (const root of roots) {
     if (isCancelled()) return
     if (!fs.existsSync(root)) continue
 
+    // 流式遍历：walkStream 不带 stats（盘根可正常递归产出路径字符串）。
+    // 体积由下方并发异步 stat 取得，避免逐文件串行 fs.statSync 阻塞事件循环。
     const stream = fg.stream('**/*', {
       cwd: root,
       onlyFiles: true,
@@ -86,25 +96,37 @@ export async function* scanBigFilesStream(
     })
 
     let batch: BigFileEntry[] = []
-    for await (const entry of stream) {
-      if (isCancelled()) return
-      const filePath = String(entry) // fast-glob stream 发出完整路径字符串
-      let st: fs.Stats
+    const tasks: Promise<void>[] = []
+    const statOne = async (filePath: string) => {
       try {
-        st = fs.statSync(filePath)
+        const st = await fs.promises.stat(filePath)
+        if (st.isFile() && st.size >= minBytes) {
+          batch.push({ path: filePath, size: st.size })
+        }
       } catch {
-        continue
-      }
-      if (!st.isFile()) continue
-      if (st.size < minBytes) continue
-
-      batch.push({ path: filePath, size: st.size })
-      if (batch.length >= BATCH) {
-        yield batch
-        batch = []
-        await new Promise((r) => setImmediate(r))
+        /* 权限不足 / 已不存在等忽略 */
       }
     }
+
+    for await (const filePath of stream) {
+      if (isCancelled()) return
+      scannedTotal++
+      tasks.push(statOne(String(filePath)))
+      // 滑动窗口：攒满 STAT_CONC 个 stat 任务即并发执行完，再 flush 结果批次。
+      // 这样既限制并发数（不会几万 stat 同时飞），又让遍历-统计流水线化。
+      if (tasks.length >= STAT_CONC) {
+        await Promise.all(tasks.splice(0))
+        if (batch.length >= BATCH) {
+          yield batch
+          batch = []
+          await new Promise((r) => setImmediate(r))
+        }
+      }
+      // 每 16 个文件回推一次遍历总数，使扫描进度数字平滑跳动（让用户直观看到扫描速度）
+      if (opts.onScanned && scannedTotal % 16 === 0) opts.onScanned(scannedTotal)
+    }
+    await Promise.all(tasks)
+    if (opts.onScanned) opts.onScanned(scannedTotal)
     if (batch.length) {
       yield batch
       batch = []

@@ -31,7 +31,7 @@ import Feedback from './views/Feedback.vue'
 import { applyTheme } from './stores/settings'
 import { initI18n } from './stores/i18n'
 import { initHealth } from './stores/health'
-import { assertApiKeys } from './api/electron'
+import { assertApiKeys, refreshDisks, refreshPhysicalDisks } from './api/electron'
 
 type ViewKey =
   | 'home'
@@ -134,6 +134,12 @@ onMounted(() => {
   initHealth()
   // 开发期自检：preload 漏更新时立刻在控制台报警（preload 不随 HMR 更新）
   if (import.meta.env.DEV) assertApiKeys()
+
+  // 启动即后台静默预读盘符（卷）与物理磁盘：首次进入大文件 / 重复 / 安装包 /
+  // 日志 / 磁盘优化等页面时不再等待 PowerShell 查询（此前各页面 onMounted 各自
+  // 读取一次，首次会卡几秒）。失败静默忽略，各页面仍会用本地缓存兜底。
+  void refreshDisks().catch(() => {})
+  void refreshPhysicalDisks().catch(() => {})
 
   // 滚动条「滚动时才显示」：捕获阶段监听所有滚动，给滚动元素临时加 .is-scrolling，
   // 停止滚动 900ms 后移除（CSS 里默认滑块透明，只有 .is-scrolling 才显示）。

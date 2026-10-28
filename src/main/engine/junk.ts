@@ -28,6 +28,36 @@ const SYSTEM_MARKER_FILES = new Set([
 ])
 
 /**
+ * 易锁定 / 易占用文件（临时文件、锁文件、波浪号临时文件等）：这类文件常被运行中的
+ * 程序以排他方式占用，清理时极易出现 EBUSY（资源忙）/ EPERM（拒绝访问）。
+ * 在扫描阶段即预判能否删除，打不开（被占用 / 无权限）则直接从列表隐藏，
+ * 既不列出也不在清理结束弹出「N 项失败」提示。
+ * 注：预判基于 TOCTOU，无法 100% 准确；删除阶段另有兜底把漏网的占用文件
+ * 归入「跳过」而非「失败」。
+ */
+const LOCK_PRONE = /\.(tmp|temp|lock|partial)(\.|$)/i
+function isLockProneFile(filePath: string): boolean {
+  const base = path.basename(filePath)
+  return LOCK_PRONE.test(base) || base.endsWith('~')
+}
+
+/**
+ * 尝试以只读方式打开文件并立即关闭：若被其他进程排他占用（EBUSY/ETXTBSY）
+ * 或无访问权限（EACCES/EPERM），说明当前无法删除，预判跳过。
+ * 只读属性文件用 'r' 仍可打开（能否删除由其属性决定，删除阶段会先 chmod 解除），
+ * 故不会误伤可正常清理的文件。返回 true 表示可打开、大概率可删。
+ */
+function canOpenForDelete(filePath: string): boolean {
+  try {
+    const fd = fs.openSync(filePath, 'r')
+    fs.closeSync(fd)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
  * 系统盘 Windows 目录下「可能影响系统运行与设置」的关键位置（不区分大小写）。
  * 扫描到这些位置下的文件直接跳过，不列入垃圾，避免误清导致系统异常。
  * 其余 Windows 文件（Temp / Logs / Prefetch / SoftwareDistribution\Download /
@@ -166,6 +196,11 @@ export async function* scanJunkStream(
     })
   }
 
+  // 串行流式扫描：每条规则一个 fg.stream 异步遍历，命中即按 BATCH 批量产出并让权。
+  // 说明：曾试过多规则并发遍历（并发 fg.stream），但在单块系统盘上多路深度递归 +
+  // 每文件同步 statSync 会造成磁盘 IO 争用与事件循环饥饿，fg.stream 的异步目录读取
+  // 拿不到时间片、stream 近乎停滞，表现为「扫描卡住、候选数长时间不增长」。串行流
+  // 式虽规则间是求和耗时，但每条规则内边扫边让权、事件循环不饿死，扫描能正常推进完成。
   for (const task of tasks) {
     if (isCancelled()) return
     const stream = fg.stream(task.patterns, {
@@ -191,6 +226,12 @@ export async function* scanJunkStream(
       if (isWindowsRiskyFile(filePath)) continue
       // 跳过外壳/系统标记文件（desktop.ini、thumbs.db 等）
       if (SYSTEM_MARKER_FILES.has(path.basename(filePath).toLowerCase())) continue
+      // 跳过快捷方式（.lnk）：清理无空间收益，且常因只读属性 / 被 Shell 占用导致删除失败；
+      // 按用户要求扫描阶段即隐藏，删除阶段也自动跳过、不提示。
+      if (path.extname(filePath).toLowerCase() === '.lnk') continue
+      // 易锁定文件（.tmp/.temp/.lock/.partial/波浪号临时文件）：扫描阶段预判
+      // 能否打开，被占用 / 无权限则直接隐藏，避免清理时 EBUSY/EPERM 失败提示。
+      if (isLockProneFile(filePath) && !canOpenForDelete(filePath)) continue
       const ageDays = Math.floor((Date.now() - st.mtimeMs) / 86400000)
       if (task.maxAge > 0 && ageDays < task.maxAge) continue
       if (task.minSizeKb > 0 && st.size / 1024 < task.minSizeKb) continue

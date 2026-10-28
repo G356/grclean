@@ -3,13 +3,12 @@ import { ref, computed, onMounted, watch } from "vue";
 import {
   scanBigFiles,
   cancelScan,
-  listDisks,
   formatSize,
   buildScopeOptions,
   getLocal,
   setLocal,
   getCachedDisks,
-  setCachedDisks,
+  ensureDisksLoaded,
   deleteOne,
   type BigFileEntry,
   type DiskInfo,
@@ -49,11 +48,9 @@ function ensureScope() {
 watch(scope, (v) => setLocal(SCOPE_KEY, v));
 
 onMounted(async () => {
-  // 后台刷新盘符列表并缓存；失败则保留上次缓存
+  // 共享单例：启动已预热，通常瞬时返回；失败则保留缓存值
   try {
-    const list = await listDisks();
-    disks.value = list;
-    setCachedDisks(list);
+    disks.value = await ensureDisksLoaded();
   } catch {
     /* 保留缓存值 */
   }
@@ -84,7 +81,20 @@ function pct(size: number) {
   return Math.max(2, Math.round((size / maxSize.value) * 100));
 }
 
-async function removeBig(f: BigFileEntry) {
+/** 单条删除：先弹确认框，确认后再执行。 */
+const bigDelConfirmOpen = ref(false)
+const bigDelTarget = ref<BigFileEntry | null>(null)
+
+function askDeleteBig(f: BigFileEntry) {
+  if (deleting.value.has(f.path)) return
+  bigDelTarget.value = f
+  bigDelConfirmOpen.value = true
+}
+
+async function confirmDeleteBig() {
+  const f = bigDelTarget.value
+  if (!f) return
+  bigDelConfirmOpen.value = false
   if (deleting.value.has(f.path)) return
   deleting.value.add(f.path)
   try {
@@ -104,7 +114,67 @@ async function removeBig(f: BigFileEntry) {
     showDlg("err", "删除失败", String(e), f.path)
   } finally {
     deleting.value.delete(f.path)
+    bigDelTarget.value = null
   }
+}
+
+// ===== 批量选择 / 删除所选 =====
+const selectedIds = ref<Set<string>>(new Set())
+const selectedCount = computed(() => selectedIds.value.size)
+const allSelected = computed(
+  () =>
+    files.value.length > 0 &&
+    files.value.every((f) => selectedIds.value.has(f.path)),
+)
+function toggleRow(f: BigFileEntry) {
+  const s = new Set(selectedIds.value)
+  if (s.has(f.path)) s.delete(f.path)
+  else s.add(f.path)
+  selectedIds.value = s
+}
+function toggleAll() {
+  selectedIds.value = allSelected.value
+    ? new Set()
+    : new Set(files.value.map((f) => f.path))
+}
+
+// 删除所选：确认弹框 → 进度弹框 → 完成弹框（均为软件 Modal）
+const confirmDelOpen = ref(false)
+const delProgressOpen = ref(false)
+const delDoneOpen = ref(false)
+const delDone = ref(0)
+const delTotal = ref(0)
+const delDeleted = ref(0)
+const delFailed = ref(0)
+
+function askDeleteSelected() {
+  if (!selectedCount.value) return
+  confirmDelOpen.value = true
+}
+async function confirmDeleteSelected() {
+  confirmDelOpen.value = false
+  const ids = [...selectedIds.value]
+  delTotal.value = ids.length
+  delDone.value = 0
+  delDeleted.value = 0
+  delFailed.value = 0
+  delProgressOpen.value = true
+  const failed = new Set<string>()
+  for (const path of ids) {
+    try {
+      const r = await deleteOne(path)
+      if (r.ok) delDeleted.value++
+      else delFailed.value++
+    } catch {
+      delFailed.value++
+    }
+    delDone.value++
+  }
+  // 从列表移除删除成功的条目，保留失败项供用户核查
+  files.value = files.value.filter((f) => !failed.has(f.path))
+  selectedIds.value = new Set()
+  delProgressOpen.value = false
+  delDoneOpen.value = true
 }
 
 async function doScan() {
@@ -117,18 +187,30 @@ async function doScan() {
     // 实现「从上方逐行增加」的流式观感；后端命令返回时再用权威排序结果覆盖。
     // seen 用 Set 去重：避免每来一项都对整表 some() 扫描（O(n²) → O(n)）
     const seen = new Set<string>();
-    const res = await scanBigFiles(
+    await scanBigFiles(
       minMb.value,
       scope.value,
       (item) => {
-        scannedCount.value += 1;
-        if (!seen.has(item.path)) {
-          seen.add(item.path);
-          files.value.unshift(item);
+        if (seen.has(item.path)) return;
+        seen.add(item.path);
+        // 边扫边按「大小降序」二分插入：始终保持从大到小，且是流式逐行增加，
+        // 避免末尾一次性整体重排；v-memo 按行 key 复用，仅做 DOM 位移、不重渲。
+        const arr = files.value;
+        let lo = 0;
+        let hi = arr.length;
+        while (lo < hi) {
+          const mid = (lo + hi) >> 1;
+          if (arr[mid].size > item.size) lo = mid + 1;
+          else hi = mid;
         }
+        arr.splice(lo, 0, item);
+      },
+      (n) => {
+        // 后端回推的「已遍历文件总数」（含未达阈值的文件），用于进度展示
+        scannedCount.value = n;
       },
     );
-    files.value = res.slice().sort((a, b) => b.size - a.size);
+    // 体积最大值统一在结束时计算（流式期间保持 maxSize 稳定，避免每行随新文件重渲）
     maxSize.value = files.value.reduce((m, f) => Math.max(m, f.size), 1);
     void recordScan('big', `${files.value.length} 个文件 · ${formatSize(totalSize.value)}`);
   } catch (e: any) {
@@ -180,9 +262,16 @@ async function doScan() {
         <div
           v-for="f in files"
           :key="f.path"
-          v-memo="[f, deleting.has(f.path), maxSize]"
+          v-memo="[f, deleting.has(f.path), maxSize, selectedIds.has(f.path)]"
           class="row"
         >
+          <label class="row-chk" @click.stop>
+            <input
+              type="checkbox"
+              :checked="selectedIds.has(f.path)"
+              @change="toggleRow(f)"
+            />
+          </label>
           <span class="path" :title="f.path">{{ f.path }}</span>
           <div class="bar">
             <div class="fill" :style="{ width: pct(f.size) + '%' }"></div>
@@ -203,7 +292,7 @@ async function doScan() {
               title="删除（移入回收站）"
               no-drag
               :disabled="deleting.has(f.path)"
-              @click.stop="removeBig(f)"
+              @click.stop="askDeleteBig(f)"
             >
               <span v-if="deleting.has(f.path)" class="spinner"></span>
               <Trash2 v-else :size="15" />
@@ -216,7 +305,11 @@ async function doScan() {
         loading
         :icon="FileSearch"
         title="分析中……"
-      />
+      >
+        <template #title-suffix>
+          <span class="scan-count">已扫描 {{ scannedCount }} 个文件</span>
+        </template>
+      </EmptyState>
       <EmptyState
         v-else-if="!scanned"
         :icon="FileSearch"
@@ -229,6 +322,21 @@ async function doScan() {
         title="未发现对应记录"
         desc="当前阈值下没有发现大文件，可调低阈值后重新分析。"
       />
+
+      <div v-if="files.length" class="bulk-bar">
+        <button
+          class="btn btn-danger"
+          :disabled="!selectedCount || loading"
+          @click="askDeleteSelected"
+        >
+          删除所选{{ selectedCount ? `（${selectedCount}）` : '' }}
+        </button>
+        <button class="btn" :disabled="!files.length || loading" @click="toggleAll">
+          {{ allSelected ? '全不选' : '全选' }}
+        </button>
+        <span class="muted bulk-info">已选 {{ selectedCount }} / {{ files.length }}</span>
+        <span class="muted bulk-scan">已扫描 {{ scannedCount }} 个文件，{{ files.length }} 项结果</span>
+      </div>
     </div>
 
     <!-- 单条删除 / 打开目录 的结果提示（弹窗，不再用行内大字提示） -->
@@ -242,6 +350,85 @@ async function doScan() {
       <p v-if="dlg.detail" class="muted dlg-path">{{ dlg.detail }}</p>
       <template #footer>
         <button class="btn btn-primary" @click="dlg.open = false">确定</button>
+      </template>
+    </Modal>
+
+    <!-- 单条删除：确认（软件 Modal，替代系统 confirm） -->
+    <Modal
+      :open="bigDelConfirmOpen"
+      title="删除确认"
+      width="440px"
+      @update:open="bigDelConfirmOpen = $event"
+    >
+      <p>
+        确定要删除以下大文件吗？删除后将移入回收站，可从回收站还原。
+      </p>
+      <div v-if="bigDelTarget" class="row-del-path">
+        <div class="row-del-name">
+          {{ bigDelTarget.path }}
+        </div>
+        <div class="row-del-size muted">
+          {{ formatSize(bigDelTarget.size) }}
+        </div>
+      </div>
+      <template #footer>
+        <button class="btn" @click="bigDelConfirmOpen = false">取消</button>
+        <button class="btn btn-danger" @click="confirmDeleteBig">删除</button>
+      </template>
+    </Modal>
+
+    <!-- 删除所选：确认 -->
+    <Modal
+      :open="confirmDelOpen"
+      title="删除确认"
+      width="440px"
+      @update:open="confirmDelOpen = $event"
+    >
+      <p>
+        确定要删除选中的 <b>{{ selectedCount }}</b> 个大文件吗？删除后将移入回收站，可从回收站还原。
+      </p>
+      <template #footer>
+        <button class="btn" @click="confirmDelOpen = false">取消</button>
+        <button class="btn btn-danger" @click="confirmDeleteSelected">删除</button>
+      </template>
+    </Modal>
+
+    <!-- 删除所选：进度（进行中不可关闭） -->
+    <Modal
+      :open="delProgressOpen"
+      title="正在删除"
+      width="440px"
+      :close-on-mask="false"
+      hide-close
+      @update:open="delProgressOpen = $event"
+    >
+      <p>正在将选中的大文件移入回收站，请稍候……</p>
+      <div class="del-progress">
+        <div class="bar">
+          <div
+            class="fill"
+            :style="{
+              width: (delTotal ? Math.round((delDone / delTotal) * 100) : 0) + '%',
+            }"
+          ></div>
+        </div>
+        <span class="muted">{{ delDone }} / {{ delTotal }}</span>
+      </div>
+    </Modal>
+
+    <!-- 删除所选：完成 -->
+    <Modal
+      :open="delDoneOpen"
+      title="删除完成"
+      width="440px"
+      @update:open="delDoneOpen = $event"
+    >
+      <p>已移入回收站 <b>{{ delDeleted }}</b> 个大文件。</p>
+      <p v-if="delFailed" class="muted">
+        {{ delFailed }} 个文件未能删除（多为文件被其他程序占用或受系统保护），可稍后重试。
+      </p>
+      <template #footer>
+        <button class="btn btn-primary" @click="delDoneOpen = false">确定</button>
       </template>
     </Modal>
   </div>
@@ -344,6 +531,56 @@ async function doScan() {
   color: var(--danger);
   font-size: calc(13px * var(--fs-scale));
 }
+.scan-count {
+  font-size: calc(13px * var(--fs-scale));
+  color: var(--muted);
+  font-weight: 400;
+  white-space: nowrap;
+}
+.toolbar-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.toolbar-progress .bar {
+  flex: 1;
+}
+.row-chk {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: calc(13px * var(--fs-scale));
+  flex: none;
+  cursor: pointer;
+}
+.row-chk input {
+  margin-top: 2px;
+  cursor: pointer;
+}
+.bulk-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.bulk-info {
+  font-size: calc(12px * var(--fs-scale));
+}
+.bulk-scan {
+  font-size: calc(12px * var(--fs-scale));
+  margin-left: auto;
+}
+.del-progress {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 6px;
+}
+.del-progress .bar {
+  flex: 1;
+}
 .dlg-ok {
   color: var(--success);
   font-size: calc(14px * var(--fs-scale));
@@ -356,5 +593,21 @@ async function doScan() {
   margin-top: 8px;
   font-size: calc(12px * var(--fs-scale));
   word-break: break-all;
+}
+.row-del-path {
+  margin-top: 12px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg);
+  padding: 8px 10px;
+}
+.row-del-name {
+  font-size: calc(13px * var(--fs-scale));
+  color: var(--text);
+  word-break: break-all;
+}
+.row-del-size {
+  margin-top: 4px;
+  font-size: calc(12px * var(--fs-scale));
 }
 </style>

@@ -19,6 +19,7 @@ import {
 import OpenFolder from "../components/OpenFolder.vue";
 import EmptyState from "../components/EmptyState.vue";
 import Select from "../components/Select.vue";
+import Modal from "../components/Modal.vue";
 
 const items = ref<MigrateItem[]>([]);
 const targets = ref<MigrateTarget[]>([]);
@@ -29,6 +30,9 @@ const notice = ref("");
 const minMb = ref(200);
 /** 是否完成过一次读取（区分「尚未读取」与「无符合目录」）。 */
 const loaded = ref(false);
+/** 扫描进度：已统计目录数 / 候选目录总数 */
+const scannedDirs = ref(0);
+const totalDirs = ref(0);
 
 /** 目标盘符（默认选剩余空间最大的非系统盘） */
 const targetLetter = ref("");
@@ -39,6 +43,11 @@ const selected = ref<Record<string, boolean>>({});
 const selectedIds = computed(() =>
   items.value.filter((i) => selected.value[i.id] && !i.isJunction).map((i) => i.id),
 );
+/** 全部可选（非联接）条目是否已选中 —— 控制「全选 / 全不选」按钮文案。 */
+const allSelected = computed(() => {
+  const selectable = items.value.filter((i) => !i.isJunction);
+  return selectable.length > 0 && selectable.every((i) => selected.value[i.id]);
+});
 
 const targetRoot = computed(() =>
   targetLetter.value ? `${targetLetter.value}:\\${subDir.value}` : "",
@@ -132,13 +141,22 @@ async function load() {
     // 后端逐条发送可迁移目录（从上方插入），前端边扫边显示；
     // 返回按体积降序的权威结果后覆盖。
     // seen 用 Set 去重：避免每来一项都对整表 some() 扫描（O(n²) → O(n)）
+    scannedDirs.value = 0;
+    totalDirs.value = 0;
     const seen = new Set<string>();
-    items.value = await listMigratable(minMb.value, (it) => {
-      if (!seen.has(it.id)) {
-        seen.add(it.id);
-        items.value.unshift(it);
-      }
-    });
+    items.value = await listMigratable(
+      minMb.value,
+      (it) => {
+        if (!seen.has(it.id)) {
+          seen.add(it.id);
+          items.value.unshift(it);
+        }
+      },
+      (done, total) => {
+        scannedDirs.value = done;
+        totalDirs.value = total;
+      },
+    );
     await refreshTargets();
   } catch (e: any) {
     error.value = String(e);
@@ -149,6 +167,10 @@ async function load() {
 }
 
 // 不再进入页面自动读取，等待用户点击按钮触发
+
+const showConfirm = ref(false);
+/** 迁移确认对话框提示文案（软件自带 Modal 替代系统 confirm）。 */
+const confirmTip = ref("");
 
 async function doMigrate() {
   const ids = selectedIds.value;
@@ -165,20 +187,39 @@ async function doMigrate() {
       "目标盘剩余空间不足（需大于待迁移数据的 1.2 倍），请换一个盘符或减少选择。";
     return;
   }
-  const tip =
+  confirmTip.value =
     `确认把 ${ids.length} 个目录迁移到 ${targetRoot.value}？\n\n` +
     `流程：robocopy 移动 → mklink /J 建目录联接 → 读写校验；\n` +
     `任一步失败会自动回滚。软件不会感知路径变化。\n\n` +
     `注意：迁移过程中请勿关闭软件或断电。`;
-  if (!confirm(tip)) return;
+  showConfirm.value = true;
+}
 
+/** Modal「确认迁移」回调：执行实际迁移流程，并实时刷新进度 Modal。 */
+const showMigrating = ref(false);
+const migProgress = ref<{ done: number; total: number; current: string }>({
+  done: 0,
+  total: 0,
+  current: "",
+});
+
+async function confirmMigrate() {
+  showConfirm.value = false;
+  const ids = selectedIds.value;
   busy.value = true;
   error.value = "";
+  notice.value = "";
   const msgs: string[] = [];
+  // 打开进度 Modal（不可关闭，提示勿关软件）
+  showMigrating.value = true;
+  migProgress.value = { done: 0, total: ids.length, current: "" };
   try {
     for (const id of ids) {
+      const it = items.value.find((x) => x.id === id);
+      migProgress.value.current = it ? it.name : id;
       const r = await migrateDirectory(id, targetRoot.value);
       msgs.push(`${r.ok ? "✓" : "✗"} ${r.message}`);
+      migProgress.value.done++;
     }
     notice.value = msgs.join("\n");
     await load();
@@ -186,6 +227,7 @@ async function doMigrate() {
     error.value = `迁移失败：${String(e)}`;
   } finally {
     busy.value = false;
+    showMigrating.value = false;
   }
 }
 
@@ -203,6 +245,15 @@ async function doRestore(id: string) {
     busy.value = false;
   }
 }
+
+/** 一键「全选 / 全不选」：切换所有非联接条目的勾选状态（绑定次级按钮）。 */
+function toggleSelectAll() {
+  const on = !allSelected.value;
+  for (const it of items.value) {
+    if (it.isJunction) continue;
+    selected.value[it.id] = on;
+  }
+}
 </script>
 
 <template>
@@ -213,7 +264,7 @@ async function doRestore(id: string) {
     </h1>
     <p class="muted">
       把仍在使用的软件数据目录从 C 盘搬到其它盘，并用<b>目录联接（mklink /J）</b>回填原路径，
-      软件无感知。迁移前校验目标盘空间 &gt; 源数据 1.2 倍，迁移后读写校验，失败自动回滚。
+      软件无感知。迁移前校验目标盘空间 &gt; 源数据 1.2 倍，迁移后读写校验，失败自动回滚。（排除系统/浏览器等核心目录，如已是链接可以还原）
     </p>
 
     <div class="card fill-card" style="margin-top: 14px">
@@ -227,11 +278,22 @@ async function doRestore(id: string) {
         <span class="muted">MB</span>
         <button v-if="loading" class="btn" @click="cancelScan">取消</button>
         <span class="spacer" />
-        <span class="muted" v-if="items.length">共 {{ items.length }} 个目录</span>
+        <span class="muted" v-if="loading && totalDirs">
+          已统计 {{ scannedDirs }} / {{ totalDirs }} 个目录
+        </span>
+        <span class="muted" v-else-if="items.length">共 {{ items.length }} 个目录</span>
       </div>
 
       <div v-if="loading" class="progress toolbar-progress">
-        <div class="bar indeterminate"></div>
+        <div
+          class="bar"
+          :class="{ indeterminate: !totalDirs }"
+          :style="
+            totalDirs
+              ? { width: Math.round((scannedDirs / totalDirs) * 100) + '%' }
+              : undefined
+          "
+        ></div>
       </div>
 
       <div class="target-bar">
@@ -246,14 +308,6 @@ async function doRestore(id: string) {
         <span class="muted">\</span>
         <input v-model="subDir" class="kw" placeholder="目标子目录" />
         <span class="muted small">目标：{{ targetRoot || "（未选择）" }}</span>
-        <span class="spacer" />
-        <span v-if="selectedIds.length" class="space" :class="{ bad: !spaceEnough }">
-          待迁移 {{ formatSize(selectedBytes) }}
-          <template v-if="activeTarget">
-            · 目标盘剩余 {{ formatSize(activeTarget.freeBytes) }}
-            {{ spaceEnough ? "（空间充足）" : "（空间不足）" }}
-          </template>
-        </span>
       </div>
 
       <p v-if="!loading && !targetOptions.length" class="muted small empty-target">
@@ -315,11 +369,65 @@ async function doRestore(id: string) {
         >
           {{ busy ? "迁移中…" : `迁移选中（${selectedIds.length} · ${formatSize(selectedBytes)}）` }}
         </button>
-        <span class="muted">
-          系统 / 浏览器核心目录已排除；已是联接的目录可一键还原。
+        <button class="btn" :disabled="busy || !items.length" @click="toggleSelectAll">
+          {{ allSelected ? "全不选" : "全选" }}
+        </button>
+        <span v-if="selectedIds.length" class="space" :class="{ bad: !spaceEnough }">
+          待迁移 {{ formatSize(selectedBytes) }}
+          <template v-if="activeTarget">
+            · 目标盘剩余 {{ formatSize(activeTarget.freeBytes) }}
+            {{ spaceEnough ? "（空间充足）" : "（空间不足）" }}
+          </template>
         </span>
       </div>
     </div>
+
+    <!-- 迁移确认对话框（软件自带 Modal，替代系统 confirm） -->
+    <Modal
+      :open="showConfirm"
+      title="确认迁移"
+      width="460px"
+      @update:open="showConfirm = $event"
+    >
+      <p style="white-space: pre-line">{{ confirmTip }}</p>
+      <template #footer>
+        <button class="btn" @click="showConfirm = false">取消</button>
+        <button class="btn btn-primary" :disabled="busy" @click="confirmMigrate">
+          确认迁移
+        </button>
+      </template>
+    </Modal>
+
+    <!-- 迁移进度对话框：迁移期间常驻，不可关闭，提示勿关软件 -->
+    <Modal
+      :open="showMigrating"
+      title="迁移中…"
+      width="460px"
+      :close-on-mask="false"
+      :hide-close="true"
+    >
+      <div class="mig-progress">
+        <div class="mig-warn">
+          ⚠ 迁移过程中请<b>不要关闭软件或断电</b>，否则可能导致数据不完整。
+        </div>
+        <div class="mig-bar">
+          <div
+            class="mig-fill"
+            :style="{
+              width: migProgress.total
+                ? Math.round((migProgress.done / migProgress.total) * 100) + '%'
+                : '0%',
+            }"
+          ></div>
+        </div>
+        <div class="mig-stat">
+          已完成 {{ migProgress.done }} / {{ migProgress.total }} 个目录
+        </div>
+        <div v-if="migProgress.current" class="mig-cur">
+          正在迁移：<b>{{ migProgress.current }}</b>
+        </div>
+      </div>
+    </Modal>
   </div>
 </template>
 
@@ -462,4 +570,35 @@ async function doRestore(id: string) {
 }
 .h-with-icon { display: flex; align-items: center; gap: 8px; }
 .title-icon { flex-shrink: 0; }
+.mig-progress { display: flex; flex-direction: column; gap: 14px; }
+.mig-warn {
+  font-size: calc(13px * var(--fs-scale));
+  color: #d98324;
+  background: rgba(217, 131, 36, 0.1);
+  border: 1px solid rgba(217, 131, 36, 0.35);
+  border-radius: 10px;
+  padding: 10px 12px;
+  line-height: 1.6;
+}
+.mig-bar {
+  height: 10px;
+  border-radius: 6px;
+  background: var(--border);
+  overflow: hidden;
+}
+.mig-fill {
+  height: 100%;
+  background: var(--primary);
+  border-radius: 6px;
+  transition: width 0.25s ease;
+}
+.mig-stat {
+  font-size: calc(13px * var(--fs-scale));
+  color: var(--text);
+}
+.mig-cur {
+  font-size: calc(12px * var(--fs-scale));
+  color: var(--muted);
+}
+.mig-cur b { color: var(--text); }
 </style>

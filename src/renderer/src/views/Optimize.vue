@@ -14,8 +14,7 @@ import {
   pfInfo,
   pfTargets as listPfTargets,
   pfApply,
-  listDisks,
-  listPhysicalDisks,
+  ensurePhysicsVolumesLoaded,
   formatSize,
   getLocal,
   setLocal,
@@ -124,9 +123,10 @@ const STATUS_META: Record<string, { label: string; color: string }> = {
 
 async function loadDisks() {
   try {
-    const [phys, vols] = await Promise.all([listPhysicalDisks(), listDisks()]);
+    // 共享单例预加载（启动已预热物理盘与卷）：返回物理磁盘 + 卷（含系统盘标记）
+    const { physicals: phys, volumes: vols } = await ensurePhysicsVolumesLoaded();
     physicals.value = phys;
-    disksWithSystem.value = (vols || []).map((d) => ({ letter: d.letter, system: d.system }));
+    disksWithSystem.value = vols || [];
     // 持久化磁盘列表：下次进入下拉直接显示，无需等待读取
     setLocal(
       DISKS_CACHE_KEY,

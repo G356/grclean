@@ -411,3 +411,62 @@ export async function deleteContextMenu(
   }
   return out
 }
+
+/**
+ * 重启 Windows 资源管理器，让右键菜单改动立即生效。
+ *
+ * 背景：经典菜单开关写入注册表后，已在运行的 explorer.exe 会缓存该 CLSID 的判定结果，
+ * 不重启就看不到任何变化（这是「切换成功但看起来没生效」的真正原因）。
+ * 注意：会关闭已打开的文件夹窗口，任务栏短暂消失后自动恢复。
+ */
+export async function restartExplorer(): Promise<void> {
+  await runPs(`
+Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }
+`)
+}
+
+// ============================================================
+// 经典 / Win11 右键菜单切换（§3.13 补充）
+// Win11 把经典完整右键菜单藏到「显示更多选项」里。在 HKCU\Software\Classes\CLSID
+// 下新建 {86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32（默认值为空字符串）即可
+// 还原经典菜单；删除该键即回到 Win11 新菜单。仅当前用户、无需管理员权限，
+// 但需重启资源管理器（或注销）后生效。
+// ============================================================
+
+const CLASSIC_MENU_KEY =
+  'Registry::HKEY_CURRENT_USER\\Software\\Classes\\CLSID\\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}'
+const CLASSIC_MENU_INPROC = `${CLASSIC_MENU_KEY}\\InprocServer32`
+
+/** 当前是否处于「经典（完整）右键菜单」模式。 */
+export async function getClassicMenuEnabled(): Promise<boolean> {
+  try {
+    const out = (await runPs(`Test-Path -LiteralPath ${psQuote(CLASSIC_MENU_KEY)}`)).trim().toLowerCase()
+    return out === 'true'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 启用（恢复经典菜单）或关闭（切回 Win11 新菜单）。
+ * 通过抛出错误让上层 handler 转为 { ok:false } 结果。
+ */
+export async function setClassicMenuEnabled(enabled: boolean): Promise<void> {
+  if (enabled) {
+    // 实测注意（PS 5.1）：
+    // 1) New-Item 没有 -LiteralPath 参数，只能用 -Path（路径里的 {} 不是通配符，安全）；
+    // 2) Set-ItemProperty 没有 -Type 参数（那是 New-ItemProperty 的 -PropertyType），
+    //    故沿用本文件 setContextMenuDisabled 的写法用 New-ItemProperty -Force 建/改默认值。
+    await runPs(`
+New-Item -Path ${psQuote(CLASSIC_MENU_KEY)} -Force | Out-Null
+New-Item -Path ${psQuote(CLASSIC_MENU_INPROC)} -Force | Out-Null
+New-ItemProperty -LiteralPath ${psQuote(CLASSIC_MENU_INPROC)} -Name '(default)' -Value '' -PropertyType String -Force | Out-Null
+`)
+  } else {
+    await runPs(
+      `Remove-Item -LiteralPath ${psQuote(CLASSIC_MENU_KEY)} -Recurse -Force -ErrorAction SilentlyContinue`,
+    )
+  }
+}

@@ -159,6 +159,8 @@ function createWindow(): void {
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
 app.whenReady().then(async () => {
+  // 启动标记：打印版本，便于确认「新主进程」已加载（dev 下改主进程代码必须整窗重启才生效）
+  console.log(`[GrClean] main process started, version=${app.getVersion()}`)
   // Set app user model id for windows
   // 必须与 electron-builder.yml 的 appId 一致，否则任务栏图标 / 通知分组的归属会错乱
   electronApp.setAppUserModelId('com.graent.grclean')
@@ -186,6 +188,12 @@ app.whenReady().then(async () => {
   })
 
   createWindow()
+
+  // 预热回收站原生 exe（非阻塞）：把未签名二进制的冷启动扫描开销挪到开屏，
+  // 避免首次删除时卡在进程启动（单条删除观感上像十几秒卡死）。忽略结果。
+  import('./engine/trash-bin')
+    .then((m) => m.warmTrashExe())
+    .catch(() => {})
 
   app.on('activate', function () {
     // On macOS it's common to re-create a window in the app when the

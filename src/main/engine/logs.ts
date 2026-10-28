@@ -210,8 +210,15 @@ export async function* scanLogsStream(
   minDays: number,
   drive: string,
   isCancelled: () => boolean,
+  onProgress?: (n: number) => void,
 ): AsyncGenerator<LogItem[], void, unknown> {
   const cutoff = Math.max(minDays, 0) > 0 ? Date.now() - minDays * 86400_000 : 0
+  let scannedTotal = 0
+  const bump = () => {
+    // 每累计 16 个被检查的文件回推一次，使界面「已扫描 N 个文件」平滑跳动，
+    // 与大文件 / 社交扫描一致（不再是扫完才显示或成段跳变）。
+    if (scannedTotal % 16 === 0) onProgress?.(scannedTotal)
+  }
 
   // 1) 应用日志 / 临时日志：*.log
   // 默认（'' / 'all'）：当前用户 profile 下的日志目录 + 所有非系统盘盘根。
@@ -238,6 +245,8 @@ export async function* scanLogsStream(
         const p = String(entry)
         const st = statSafe(p)
         if (!st || !st.isFile()) continue
+        scannedTotal++
+        bump()
         if (cutoff && st.mtimeMs > cutoff) continue
         if (st.size === 0) continue
         batch.push({
@@ -268,6 +277,7 @@ export async function* scanLogsStream(
       yield batch
       await new Promise((r) => setImmediate(r))
     }
+    onProgress?.(scannedTotal)
   }
 
   // 2) 崩溃转储 / WER 报告：整体按目录统计（*.dmp 单文件 + 报告目录）
@@ -297,6 +307,8 @@ export async function* scanLogsStream(
       if (isCancelled()) return
       const st = statSafe(p)
       if (!st || !st.isFile()) continue
+      scannedTotal++
+      bump()
       if (cutoff && st.mtimeMs > cutoff) continue
       batch.push({
         id: hashId(p),

@@ -501,12 +501,15 @@ function scanBigFiles(
   minMb: number,
   scope: string,
   onItem: (item: BigFileEntry) => void,
+  onProgress?: (n: number) => void,
 ): Promise<BigFileEntry[]> {
   return new Promise<BigFileEntry[]>((resolve, reject) => {
     const channel = 'scan-bigfiles'
     const handler = (_e: IpcRendererEvent, payload: any) => {
       if (payload.type === 'item') {
         for (const it of payload.items as BigFileEntry[]) onItem(it)
+      } else if (payload.type === 'progress') {
+        if (onProgress) onProgress(payload.scanned as number)
       } else if (payload.type === 'done') {
         ipcRenderer.removeListener(channel, handler)
         resolve(payload.result as BigFileEntry[])
@@ -595,44 +598,63 @@ function scanRegistry(
   })
 }
 
-// 已安装程序流式封装
+// 已安装程序流式封装（条目边扫边出；图标异步到达后单独回调 onIcon）
 function scanUninstall(
   onItem: (item: UninstallEntry) => void,
+  onIcon?: (id: string, icon: string) => void,
 ): Promise<UninstallEntry[]> {
   return new Promise<UninstallEntry[]>((resolve, reject) => {
     const channel = 'scan-uninstall'
+    const iconChannel = 'uninstall:icon'
+    const iconHandler = (_e: IpcRendererEvent, payload: any) => {
+      if (onIcon && payload?.id) onIcon(String(payload.id), String(payload.icon ?? ''))
+    }
     const handler = (_e: IpcRendererEvent, payload: any) => {
       if (payload.type === 'item') {
         for (const it of payload.items as UninstallEntry[]) onItem(it)
       } else if (payload.type === 'done') {
         ipcRenderer.removeListener(channel, handler)
+        ipcRenderer.removeListener(iconChannel, iconHandler)
         resolve(payload.result as UninstallEntry[])
       } else if (payload.type === 'error') {
         ipcRenderer.removeListener(channel, handler)
+        ipcRenderer.removeListener(iconChannel, iconHandler)
         reject(new Error(payload.message))
       }
     }
     ipcRenderer.on(channel, handler)
+    ipcRenderer.on(iconChannel, iconHandler)
     ipcRenderer.send('scan-uninstall:start')
   })
 }
 
-// 社交缓存流式封装（按应用分批产出）
-function scanSocial(onItem: (item: SocialItem) => void): Promise<SocialItem[]> {
+// 社交缓存流式封装（按应用分批产出，并回报「已扫描条目数」进度）
+function scanSocial(
+  onItem: (item: SocialItem) => void,
+  onProgress?: (scanned: number) => void,
+): Promise<SocialItem[]> {
   return new Promise<SocialItem[]>((resolve, reject) => {
     const channel = 'scan-social'
+    const progChannel = 'scan-social:progress'
     const handler = (_e: IpcRendererEvent, payload: any) => {
       if (payload.type === 'item') {
         for (const it of payload.items as SocialItem[]) onItem(it)
       } else if (payload.type === 'done') {
         ipcRenderer.removeListener(channel, handler)
+        ipcRenderer.removeListener(progChannel, progHandler)
         resolve(payload.result as SocialItem[])
       } else if (payload.type === 'error') {
         ipcRenderer.removeListener(channel, handler)
+        ipcRenderer.removeListener(progChannel, progHandler)
         reject(new Error(payload.message))
       }
     }
+    const progHandler = (_e: IpcRendererEvent, payload: any) => {
+      if (payload && typeof payload.scanned === 'number')
+        onProgress?.(payload.scanned)
+    }
     ipcRenderer.on(channel, handler)
+    ipcRenderer.on(progChannel, progHandler)
     ipcRenderer.send('scan-social:start')
   })
 }
@@ -643,12 +665,15 @@ function scanInstallers(
   minDays: number,
   drive: string,
   onItem: (item: InstallerItem) => void,
+  onProgress?: (n: number) => void,
 ): Promise<InstallerItem[]> {
   return new Promise<InstallerItem[]>((resolve, reject) => {
     const channel = 'scan-installers'
     const handler = (_e: IpcRendererEvent, payload: any) => {
       if (payload.type === 'item') {
         for (const it of payload.items as InstallerItem[]) onItem(it)
+      } else if (payload.type === 'progress') {
+        onProgress?.(payload.scanned as number)
       } else if (payload.type === 'done') {
         ipcRenderer.removeListener(channel, handler)
         resolve(payload.result as InstallerItem[])
@@ -667,12 +692,15 @@ function scanLogs(
   minDays: number,
   drive: string,
   onItem: (item: LogItem) => void,
+  onProgress?: (n: number) => void,
 ): Promise<LogItem[]> {
   return new Promise<LogItem[]>((resolve, reject) => {
     const channel = 'scan-logs'
     const handler = (_e: IpcRendererEvent, payload: any) => {
       if (payload.type === 'item') {
         for (const it of payload.items as LogItem[]) onItem(it)
+      } else if (payload.type === 'progress') {
+        onProgress?.(payload.scanned as number)
       } else if (payload.type === 'done') {
         ipcRenderer.removeListener(channel, handler)
         resolve(payload.result as LogItem[])
@@ -743,21 +771,29 @@ function scanDriversStream(
 function listMigratableStream(
   minMb: number,
   onItem: (item: MigrateItem) => void,
+  onProgress?: (done: number, total: number) => void,
 ): Promise<MigrateItem[]> {
   return new Promise<MigrateItem[]>((resolve, reject) => {
     const channel = 'migrate:list'
+    const progChannel = 'migrate:list:progress'
+    const progHandler = (_e: IpcRendererEvent, payload: any) => {
+      if (onProgress) onProgress(Number(payload?.done ?? 0), Number(payload?.total ?? 0))
+    }
     const handler = (_e: IpcRendererEvent, payload: any) => {
       if (payload.type === 'item') {
         for (const it of payload.items as MigrateItem[]) onItem(it)
       } else if (payload.type === 'done') {
         ipcRenderer.removeListener(channel, handler)
+        ipcRenderer.removeListener(progChannel, progHandler)
         resolve(payload.result as MigrateItem[])
       } else if (payload.type === 'error') {
         ipcRenderer.removeListener(channel, handler)
+        ipcRenderer.removeListener(progChannel, progHandler)
         reject(new Error(payload.message))
       }
     }
     ipcRenderer.on(channel, handler)
+    ipcRenderer.on(progChannel, progHandler)
     ipcRenderer.send('migrate:list:start', { minMb })
   })
 }
@@ -944,8 +980,22 @@ const api = {
   cancelScanSocial(): void {
     ipcRenderer.send('scan-social:cancel')
   },
-  deleteSocial(ids: string[], purge: boolean): Promise<CleanResult> {
-    return ipcRenderer.invoke('delete-social', { ids, purge })
+  deleteSocial(
+    ids: string[],
+    purge: boolean,
+    onProgress?: (ev: { type: 'items'; ids: string[] }) => void,
+  ): Promise<CleanResult> {
+    const channel = 'delete-social:progress'
+    const handler = (_e: unknown, payload: unknown) => {
+      const p = payload as { type?: string; ids?: string[] }
+      if (p?.type === 'items') onProgress?.({ type: 'items', ids: p.ids ?? [] })
+    }
+    if (onProgress) ipcRenderer.on(channel, handler)
+    return ipcRenderer
+      .invoke('delete-social', { ids, purge })
+      .finally(() => {
+        if (onProgress) ipcRenderer.removeListener(channel, handler)
+      })
   },
   // 大文件 / 单文件：删除（默认移入回收站），按路径操作，不走清理会话
   deleteOne(path: string): Promise<{ ok: boolean; error: string | null }> {
@@ -995,6 +1045,18 @@ const api = {
   },
     ctxBackupDir(): Promise<string> {
       return ipcRenderer.invoke('ctx:backup-dir')
+    },
+    /** 当前是否处于「经典（完整）右键菜单」模式。 */
+    getClassicMenuState(): Promise<boolean> {
+      return ipcRenderer.invoke('ctx:classic-state')
+    },
+    /** 切换经典 / Win11 右键菜单；需重启资源管理器或注销后生效。 */
+    setClassicMenu(enabled: boolean): Promise<{ ok: boolean; message: string }> {
+      return ipcRenderer.invoke('ctx:classic-set', { enabled })
+    },
+    /** 重启资源管理器，使右键菜单改动立即生效（会关闭已打开的文件夹窗口）。 */
+    restartExplorer(): Promise<{ ok: boolean; message: string }> {
+      return ipcRenderer.invoke('ctx:restart-explorer')
     },
     /** 在资源管理器中打开某文件 / 目录所在的目录（扫描结果一键定位）。 */
     openPath(path: string): Promise<{ ok: boolean; error: string | null }> {

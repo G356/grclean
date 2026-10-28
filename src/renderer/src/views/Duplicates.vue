@@ -6,12 +6,11 @@ import {
   deleteDuplicates,
   cancelScan,
   formatSize,
-  listDisks,
   buildScopeOptions,
   getLocal,
   setLocal,
   getCachedDisks,
-  setCachedDisks,
+  ensureDisksLoaded,
   type DuplicateGroup,
   type DuplicateFile,
   type DiskInfo,
@@ -21,6 +20,7 @@ import LastScan from "../components/LastScan.vue";
 import Select from "../components/Select.vue";
 import Modal from "../components/Modal.vue";
 import EmptyState from "../components/EmptyState.vue";
+import { settings } from "../stores/settings";
 
 const SCOPE_KEY = "grclean.scope.dup";
 
@@ -39,9 +39,7 @@ watch(scope, (v) => setLocal(SCOPE_KEY, v));
 
 onMounted(async () => {
   try {
-    const list = await listDisks();
-    disks.value = list;
-    setCachedDisks(list);
+    disks.value = await ensureDisksLoaded();
   } catch {
     /* 保留缓存值 */
   }
@@ -53,8 +51,18 @@ const loading = ref(false);
 /** 是否已执行过一次扫描（区分「暂未扫描」与「已扫描无结果」两种空态） */
 const scanned = ref(false);
 const error = ref("");
-const minSizeMb = ref(1);
+const minSizeMb = ref(1)
+/** 最小大小输入框的显示值（用 text + 数字键盘，规避 Windows 下 number 输入卡顿）。 */
+const minSizeText = ref('1')
+function onMinSizeInput(e: Event) {
+  const raw = (e.target as HTMLInputElement).value
+  minSizeText.value = raw
+  const n = parseInt(raw, 10)
+  minSizeMb.value = Number.isFinite(n) && n >= 0 ? n : 0
+};
 const progress = ref(0);
+/** 枚举到的文件总数（取扫描期间 progress 最大值：哈希阶段上报的候选数更小，不能覆盖）。 */
+const enumerated = ref(0);
 
 // 勾选状态：key = `${group_id}:${file_id}` -> 是否删除
 const selected = ref<Record<string, boolean>>({});
@@ -64,9 +72,14 @@ const result = ref<{
   size: number;
   errors: string[];
   skipped: { path: string; reason: string }[];
+  notes?: string[];
 } | null>(null);
 /** 删除完成弹窗（重新扫描 / 暂不） */
 const showDone = ref(false);
+/** 删除前确认弹窗（替代原生 confirm，统一应用内风格） */
+const showConfirm = ref(false);
+/** 待删除的副本 id 列表（确认后再执行，避免打开弹窗时丢失勾选） */
+const pendingIds = ref<string[]>([]);
 
 const totalGroups = computed(() => groups.value.length);
 const totalWasted = computed(() =>
@@ -75,6 +88,24 @@ const totalWasted = computed(() =>
 const selectedCount = computed(
   () => Object.values(selected.value).filter(Boolean).length,
 );
+/** 副本（不含每组首条）是否全部已勾选：默认首条不勾、其余勾选 → 先显示「清空副本全选」。 */
+const allCopiesSelected = computed(() => {
+  if (groups.value.length === 0) return false;
+  for (const g of groups.value) {
+    for (let i = 1; i < g.files.length; i++) {
+      if (!selected.value[keyOf(g, g.files[i])]) return false;
+    }
+  }
+  return true;
+});
+
+function toggleAllCopies() {
+  if (allCopiesSelected.value) {
+    groups.value.forEach(clearGroup);
+  } else {
+    groups.value.forEach(selectAllCopies);
+  }
+}
 
 function keyOf(g: DuplicateGroup, f: DuplicateFile) {
   return `${g.group_id}:${f.id}`;
@@ -87,6 +118,7 @@ function keepFirst(g: DuplicateGroup) {
   });
 }
 
+// 显式「选副本 / 全选副本」：勾选除首条外的全部副本（首条默认保留，需整组删除可自行勾选）
 function selectAllCopies(g: DuplicateGroup) {
   g.files.forEach((f, i) => {
     selected.value[keyOf(g, f)] = i !== 0;
@@ -106,6 +138,7 @@ async function doScan() {
   selected.value = {};
   groups.value = [];
   progress.value = 0;
+  enumerated.value = 0;
   try {
     // 后端逐组发送重复组（从上方插入），并周期推送已哈希文件数；
     // 命令返回后用权威结果覆盖（按可释放空间降序）。
@@ -117,6 +150,7 @@ async function doScan() {
       },
       (n) => {
         progress.value = n;
+        if (n > enumerated.value) enumerated.value = n;
       },
       scope.value,
     );
@@ -142,15 +176,20 @@ async function doDelete() {
     error.value = "没有选择要删除的副本。";
     return;
   }
-  if (
-    !confirm(`确认将 ${ids.length} 个重复副本移入回收站？每组建议至少保留 1 份。`)
-  ) {
-    return;
-  }
+  // 打开应用内确认弹窗（替代原生 confirm，统一风格）
+  pendingIds.value = ids;
+  showConfirm.value = true;
+}
+
+async function confirmDelete() {
+  const ids = pendingIds.value;
+  // 删除方式跟随全局配置：允许永久删除(allowPurge=true)→直接删除；否则移入回收站。
+  const purge = settings.allowPurge;
+  showConfirm.value = false;
   busy.value = true;
   error.value = "";
   try {
-    const res = await deleteDuplicates(ids, false);
+    const res = await deleteDuplicates(ids, purge);
     result.value = {
       deleted: res.deleted_count,
       size: res.deleted_size,
@@ -159,6 +198,7 @@ async function doDelete() {
         path: s.path,
         reason: s.reason,
       })),
+      notes: res.notes ?? [],
     };
     // 删除成功的条目从列表移除；被拦截 / 报错的条目保留，方便用户看到原因
     const skippedPaths = new Set((res.skipped ?? []).map((s) => s.path));
@@ -185,6 +225,11 @@ function doneRescan() {
   doScan();
 }
 
+/** 关闭错误弹框并清空错误（错误以弹框呈现，不在界面内联显示）。 */
+function dismissError() {
+  error.value = "";
+}
+
 function truncate(s: string, n = 64) {
   return s.length > n ? "…" + s.slice(s.length - n) : s;
 }
@@ -198,7 +243,7 @@ function truncate(s: string, n = 64) {
     </h1>
     <p class="muted">
       三级筛选：大小分组 → 头部哈希预筛 → 全量 SHA-256 确认。默认扫描系统盘，
-      也可选择指定盘符或全盘；删除沿用七道防线（受保护路径拦截 · 默认回收站 · 审计）。
+      也可选择指定盘符或全盘；删除沿用七道防线（受保护路径拦截 · 默认回收站 · 审计）。（默认保留第一份，剩余则为副本）
     </p>
 
     <div class="card fill-card" style="margin-top: 14px">
@@ -214,25 +259,25 @@ function truncate(s: string, n = 64) {
         <Select v-model="scope" :options="scopeOptions" :width="180" />
         <label class="ms">最小大小</label>
         <input
-          v-model.number="minSizeMb"
+          :value="minSizeText"
+          @input="onMinSizeInput"
           class="num"
-          type="number"
+          type="text"
+          inputmode="numeric"
           min="0"
         />
         <span class="muted">MB</span>
-        <span class="muted" v-if="loading && progress">
-          已扫描 {{ progress }} 个文件（哈希比对中…）
-        </span>
-        <span class="muted" v-else-if="totalGroups">
-          共 {{ totalGroups }} 组 · 可释放 {{ formatSize(totalWasted) }}
-        </span>
         <LastScan module="dup" />
+        <span class="muted scan-summary" v-if="loading">
+          已扫描 {{ enumerated }} 个文件
+        </span>
+        <span class="muted scan-summary" v-else-if="totalGroups">
+          本次共扫描 {{ enumerated }} 个文件 · 共 {{ totalGroups }} 组 · 可释放 {{ formatSize(totalWasted) }}
+        </span>
       </div>
       <div v-if="loading" class="progress toolbar-progress">
         <div class="bar indeterminate"></div>
       </div>
-
-      <div v-if="error" class="err">{{ error }}</div>
 
       <div class="list fill-list" v-if="groups.length">
         <div v-for="g in groups" :key="g.group_id" class="group">
@@ -246,14 +291,12 @@ function truncate(s: string, n = 64) {
             </button>
             <button class="btn tiny" @click="clearGroup(g)">清空</button>
           </div>
-          <div v-for="(f, i) in g.files" :key="f.id" class="row">
+          <div v-for="f in g.files" :key="f.id" class="row">
             <label class="chk">
               <input
                 type="checkbox"
                 v-model="selected[keyOf(g, f)]"
-                :disabled="i === 0"
               />
-              <span :class="{ keep: i === 0 }">{{ i === 0 ? "保留" : "删除" }}</span>
             </label>
             <div class="info">
               <div class="path" :title="f.path">{{ truncate(f.path) }}</div>
@@ -267,7 +310,11 @@ function truncate(s: string, n = 64) {
         loading
         :icon="Copy"
         title="扫描中……"
-      />
+      >
+        <template #title-suffix>
+          <span class="enum-hint">已枚举 {{ enumerated }} 个文件…</span>
+        </template>
+      </EmptyState>
       <EmptyState
         v-else-if="!scanned"
         :icon="Copy"
@@ -287,13 +334,56 @@ function truncate(s: string, n = 64) {
           :disabled="busy || selectedCount === 0"
           @click="doDelete"
         >
-          {{ busy ? "删除中…" : `删除选中副本（${selectedCount}）` }}
+          {{
+            busy
+              ? "删除中…"
+              : settings.allowPurge
+                ? `直接删除所选（${selectedCount}）`
+                : `删除所选（${selectedCount}）`
+          }}
+        </button>
+        <button
+          class="btn"
+          :disabled="busy"
+          @click="toggleAllCopies"
+        >
+          {{ allCopiesSelected ? "清空副本全选" : "全选副本" }}
         </button>
         <span class="muted"
-          >每组默认保留第 1 份，可手动调整勾选。</span
+          >勾选要删除的副本；整组勾选将彻底移除该文件（无保留副本）。</span
         >
       </div>
     </div>
+
+    <!-- 删除前确认（替代原生 confirm，与删除完成弹窗统一风格） -->
+    <Modal
+      :open="showConfirm"
+      title="删除重复副本"
+      width="460px"
+      @update:open="showConfirm = $event"
+    >
+      <p>
+        确认将 <b>{{ pendingIds.length }}</b> 个重复副本{{
+          settings.allowPurge ? "直接删除（不可恢复）" : "移入回收站"
+        }}？可自由选择要删除的副本，整组勾选会彻底移除该文件。
+      </p>
+      <p class="muted small" v-if="!settings.allowPurge">
+        移入回收站后仍可在回收站中还原；如需彻底删除，请在回收站里单独清空。
+      </p>
+      <p class="muted small warn-line" v-else>
+        已开启「允许永久删除」，这些副本将被永久删除且无法还原，请确认无误。
+      </p>
+      <template #footer>
+        <button class="btn" @click="showConfirm = false">取消</button>
+        <button
+          class="btn btn-danger"
+          :disabled="busy"
+          @click="confirmDelete"
+        >
+          {{ busy ? "删除中…" : "确认删除" }}
+        </button>
+      </template>
+    </Modal>
 
     <!-- 删除完成提示：成功 / 被拦截 / 失败 明细，并提供重新扫描 -->
     <Modal
@@ -303,9 +393,20 @@ function truncate(s: string, n = 64) {
       @update:open="showDone = $event"
     >
       <template v-if="result">
-        <p>
-          已移入回收站 <b>{{ result.deleted }}</b> 个副本，释放
+        <p v-if="result.deleted > 0">
+          {{ settings.allowPurge ? "已永久删除" : "已移入回收站" }}
+          <b>{{ result.deleted }}</b> 个副本，释放
           {{ formatSize(result.size) }}。
+        </p>
+        <p v-else class="err-line">
+          未能删除任何副本（{{ result.errors.length + result.skipped.length }}
+          项被拦截或失败，详见下方）。
+        </p>
+        <p v-if="result.deleted === 0 && !settings.allowPurge" class="muted small">
+          若这些文件位于「无回收站」的卷（如可移动盘 / 网络盘 / exFAT），移入回收站会失败。可在「设置 → 允许永久删除」开启后改为直接删除。
+        </p>
+        <p v-if="result.notes?.length" class="muted small">
+          {{ result.notes[0] }}<span v-if="result.notes.length > 1"> 等 {{ result.notes.length }} 项</span>
         </p>
         <p v-if="result.skipped.length" class="warn-line">
           {{ result.skipped.length }} 项被安全策略拦截（未删除）：
@@ -330,6 +431,19 @@ function truncate(s: string, n = 64) {
         <button class="btn btn-primary" @click="doneRescan">重新扫描</button>
       </template>
     </Modal>
+
+    <!-- 错误提示：统一以弹框呈现，不在界面内联显示 -->
+    <Modal
+      :open="!!error"
+      title="操作失败"
+      width="460px"
+      @update:open="(v: boolean) => { if (!v) dismissError() }"
+    >
+      <p class="err-line">{{ error }}</p>
+      <template #footer>
+        <button class="btn btn-primary" @click="dismissError">我知道了</button>
+      </template>
+    </Modal>
   </div>
 </template>
 
@@ -339,6 +453,9 @@ function truncate(s: string, n = 64) {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+}
+.scan-summary {
+  margin-left: auto;
 }
 .ms {
   font-size: calc(13px * var(--fs-scale));
@@ -392,14 +509,8 @@ function truncate(s: string, n = 64) {
 .chk {
   display: flex;
   align-items: center;
-  gap: 6px;
-  font-size: calc(13px * var(--fs-scale));
   flex-shrink: 0;
-  width: 64px;
-}
-.chk .keep {
-  color: var(--success);
-  font-weight: 600;
+  width: 20px;
 }
 .info {
   min-width: 0;
@@ -451,4 +562,12 @@ function truncate(s: string, n = 64) {
 }
 .h-with-icon { display: flex; align-items: center; gap: 8px; }
 .title-icon { flex-shrink: 0; }
+.enum-hint {
+  font-size: calc(13px * var(--fs-scale));
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+.small {
+  font-size: calc(12px * var(--fs-scale));
+}
 </style>

@@ -42,6 +42,6 @@ onMounted(() => {
 }
 .summary {
   color: var(--text);
-  font-weight: 600;
+  /* font-weight: 600; */
 }
 </style>

@@ -25,7 +25,10 @@ withDefaults(
   <div class="empty-state">
     <span v-if="loading" class="empty-spinner" aria-hidden="true" />
     <component v-else :is="icon" :size="32" :stroke-width="1.4" class="empty-icon" />
-    <p class="empty-title">{{ title }}</p>
+    <p class="empty-title">
+      <span class="empty-title-text">{{ title }}</span>
+      <slot name="title-suffix" />
+    </p>
     <p v-if="desc && !loading" class="empty-desc">{{ desc }}</p>
   </div>
 </template>
@@ -62,6 +65,11 @@ withDefaults(
   font-size: calc(13px * var(--fs-scale));
   font-weight: 500;
   color: var(--muted);
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 .empty-desc {
   font-size: calc(12px * var(--fs-scale));

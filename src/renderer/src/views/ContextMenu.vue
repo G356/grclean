@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { MousePointerClick, Image } from "@lucide/vue";
-import { ref, computed } from "vue";
+import { ref, computed, onMounted } from "vue";
 import {
   scanContextMenu,
   setContextMenuDisabled,
@@ -8,6 +8,11 @@ import {
   ctxBackupDir,
   scanShellIcons,
   deleteShellIcons,
+  getClassicMenuState,
+  setClassicMenu,
+  restartExplorer,
+  getLocal,
+  setLocal,
   type ContextMenuItem,
   type ShellIconItem,
 } from "../api/electron";
@@ -33,6 +38,100 @@ const showDone = ref(false);
 const keyword = ref("");
 const onlyThirdParty = ref(true);
 const backupPath = ref("");
+
+// ---------------- 经典 / Win11 右键菜单开关 ----------------
+/** true = 当前已是经典（完整）右键菜单 */
+const classicEnabled = ref(false);
+/** 是否已成功读取过开关状态（未读取前禁用按钮，避免误点） */
+const classicLoaded = ref(false);
+const classicBusy = ref(false);
+/** 切换前确认对话框 */
+const showClassicConfirm = ref(false);
+/** 切换后结果对话框 */
+const showClassicResult = ref(false);
+const classicResultOk = ref(true);
+const classicResultMsg = ref("");
+/** 正在重启资源管理器 */
+const restartBusy = ref(false);
+
+/** 右键菜单类型（经典 / Win11）的本地缓存键：记住上次检测结果，避免每次进入都查注册表。 */
+const CLASSIC_CACHE_KEY = "grclean.ctx.classicMenu";
+
+/** 按钮文案：当前经典→提示切回 Win11；当前 Win11→提示恢复经典 */
+const classicLabel = computed(() =>
+  classicEnabled.value ? "切换到 Win11 右键菜单" : "恢复经典右键菜单",
+);
+
+/**
+ * 读取当前开关状态：优先用本地缓存（上次已检测过就直接采用，不再跑 PowerShell），
+ * 只有首次进入（无缓存）才真正查询一次，并把结果记下来供下次使用。
+ */
+async function loadClassicState() {
+  const cached = getLocal(CLASSIC_CACHE_KEY);
+  if (cached === "1" || cached === "0") {
+    classicEnabled.value = cached === "1";
+    classicLoaded.value = true;
+    return;
+  }
+  try {
+    const on = await getClassicMenuState();
+    classicEnabled.value = on;
+    setLocal(CLASSIC_CACHE_KEY, on ? "1" : "0");
+  } catch {
+    classicEnabled.value = false;
+  } finally {
+    classicLoaded.value = true;
+  }
+}
+
+/** 确认后执行切换，完成后无论成败都弹出结果提示。 */
+async function doToggleClassic() {
+  showClassicConfirm.value = false;
+  classicBusy.value = true;
+  const target = !classicEnabled.value;
+  try {
+    const res = await setClassicMenu(target);
+    classicResultOk.value = !!res?.ok;
+    classicResultMsg.value =
+      res?.message || (target ? "已恢复到经典右键菜单" : "已切回 Win11 右键菜单");
+    if (res?.ok) {
+      classicEnabled.value = target;
+      // 切换成功即更新缓存，下次进入直接读取，无需再查注册表
+      setLocal(CLASSIC_CACHE_KEY, target ? "1" : "0");
+    }
+  } catch (e: any) {
+    classicResultOk.value = false;
+    classicResultMsg.value = `操作失败：${String(e)}`;
+  } finally {
+    classicBusy.value = false;
+    showClassicResult.value = true;
+  }
+}
+
+/**
+ * 重启资源管理器让改动立即生效。
+ * 注册表写成功后 explorer 仍用旧缓存，不重启就「看起来没生效」。
+ */
+async function doRestartExplorer() {
+  restartBusy.value = true;
+  try {
+    const res = await restartExplorer();
+    if (res?.ok) {
+      // 重启成功即视为已生效，关闭结果框
+      showClassicResult.value = false;
+    } else {
+      classicResultMsg.value = `重启资源管理器失败：${res?.message || "未知错误"}`;
+      classicResultOk.value = false;
+    }
+  } catch (e: any) {
+    classicResultMsg.value = `重启资源管理器失败：${String(e)}`;
+    classicResultOk.value = false;
+  } finally {
+    restartBusy.value = false;
+  }
+}
+
+onMounted(loadClassicState);
 
 const filtered = computed(() => {
   const kw = keyword.value.trim().toLowerCase();
@@ -234,6 +333,16 @@ function doneRescan() {
       </button>
       <button class="tab" :class="{ active: tab === 'icon' }" @click="tab = 'icon'">
         外壳图标（此电脑）
+      </button>
+      <span class="spacer" />
+      <button
+        class="btn btn-classic"
+        :disabled="classicBusy || !classicLoaded"
+        :title="classicEnabled ? '当前为经典右键菜单，点击切回 Win11 样式' : '当前为 Win11 右键菜单，点击恢复经典样式'"
+        @click="showClassicConfirm = true"
+      >
+        <span v-if="classicBusy" class="spinner"></span>
+        {{ classicBusy ? "切换中…" : classicLabel }}
       </button>
     </div>
 
@@ -469,6 +578,56 @@ function doneRescan() {
         <button class="btn btn-primary" @click="doneRescan">重新读取</button>
       </template>
     </Modal>
+
+    <!-- 经典 / Win11 右键菜单：切换前确认 -->
+    <Modal
+      :open="showClassicConfirm"
+      title="切换右键菜单模式"
+      width="440px"
+      @update:open="showClassicConfirm = $event"
+    >
+      <p>确定要 <b>{{ classicLabel }}</b> 吗？</p>
+      <p class="muted small">
+        该改动作用于<b>当前用户</b>，会影响文件 / 文件夹 / 桌面空白处等所有位置的右键菜单，
+        无需管理员权限。
+      </p>
+      <p class="muted small">
+        生效需<b>重启资源管理器</b>或<b>注销 / 重新登录</b>。此操作可逆，随时可再切回来。
+      </p>
+      <template #footer>
+        <button class="btn" @click="showClassicConfirm = false">取消</button>
+        <button class="btn btn-primary" @click="doToggleClassic">确认切换</button>
+      </template>
+    </Modal>
+
+    <!-- 经典 / Win11 右键菜单：切换后结果 -->
+    <Modal
+      :open="showClassicResult"
+      :title="classicResultOk ? '切换完成' : '切换失败'"
+      width="440px"
+      @update:open="showClassicResult = $event"
+    >
+      <p :class="{ err: !classicResultOk }">{{ classicResultMsg }}</p>
+      <p v-if="classicResultOk" class="muted small">
+        注册表已写入成功，但<b>资源管理器会缓存该设置，不重启看不到任何变化</b>。
+        点下方按钮立即重启（会关闭已打开的文件夹窗口，任务栏短暂消失后自动恢复），
+        或稍后自行注销 / 重新登录。
+      </p>
+      <template #footer>
+        <button class="btn" @click="showClassicResult = false">
+          稍后自行重启
+        </button>
+        <button
+          v-if="classicResultOk"
+          class="btn btn-primary"
+          :disabled="restartBusy"
+          @click="doRestartExplorer"
+        >
+          <span v-if="restartBusy" class="spinner"></span>
+          {{ restartBusy ? "重启中…" : "立即重启资源管理器" }}
+        </button>
+      </template>
+    </Modal>
   </div>
 </template>
 
@@ -497,6 +656,11 @@ function doneRescan() {
   background: var(--primary);
   border-color: var(--primary);
   color: #fff;
+}
+/* 经典 / Win11 右键菜单开关：位于 tab 栏右侧，避免被拉伸变形 */
+.btn-classic {
+  align-self: center;
+  white-space: nowrap;
 }
 .kw {
   width: 200px;

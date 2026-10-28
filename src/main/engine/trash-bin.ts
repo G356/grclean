@@ -79,11 +79,16 @@ async function recycleViaExe(filePath: string): Promise<void> {
  * 保证「移入回收站」不会因为单一实现失效而整体不可用（代价是每次要启动 PowerShell）。
  */
 async function recycleViaPowerShell(filePath: string): Promise<void> {
+  // ⚠️ 目录必须走 DeleteDirectory：DeleteFile 对目录无效（整目录清理的兜底路径曾因此静默失败）
   const script = `
 $p = ${psQuote(filePath)}
 if (-not (Test-Path -LiteralPath $p -ErrorAction SilentlyContinue)) { exit 0 }
 Add-Type -AssemblyName Microsoft.VisualBasic
-[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($p,'OnlyErrorDialogs','SendToRecycleBin')
+if ((Get-Item -LiteralPath $p -Force) -is [System.IO.DirectoryInfo]) {
+  [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($p,'OnlyErrorDialogs','SendToRecycleBin')
+} else {
+  [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($p,'OnlyErrorDialogs','SendToRecycleBin')
+}
 if (Test-Path -LiteralPath $p -ErrorAction SilentlyContinue) { throw '仍在原位置，未移入回收站' }
 `.trim()
   await runPs(script)
@@ -118,4 +123,173 @@ export async function moveToRecycleBin(filePath: string): Promise<void> {
     }
   }
   await recycleViaPowerShell(filePath)
+}
+
+/** 把数组按固定大小分块（避免一次命令行超长，且贴合 windows-trash.exe 的批量上限）。 */
+function chunkArray<T>(arr: T[], size: number): T[][] {
+  const out: T[][] = []
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size))
+  return out
+}
+
+/**
+ * 用 windows-trash.exe 一次性把多个文件移入回收站（批量，首选）。
+ * 一次进程处理一整批路径，把「删 N 个文件」的外部进程数从 N 降到 ⌈N/200⌉，
+ * 这是垃圾清理缓慢的根因（原来逐条 delete = 串行 N 次进程创建/销毁）的最优解法。
+ */
+async function recycleManyViaExe(filePaths: string[]): Promise<void> {
+  const exe = exePath()
+  await new Promise<void>((resolve, reject) => {
+    execFile(exe, filePaths, (err) => (err ? reject(err) : resolve()))
+  })
+}
+
+export interface BatchRecycleFailure {
+  path: string
+  error?: string
+}
+
+export interface BatchRecycleResult {
+  /** 最终成功移入回收站的路径（含批量成功 / 降级重试成功） */
+  succeeded: string[]
+  /** 最终失败（原位置仍存在且重试也失败）的路径与原因 */
+  failed: BatchRecycleFailure[]
+}
+
+/**
+ * 单批文件数。200 是实测的平衡点：批太小则进程启动开销占比高，批太大则命令行
+ * 逼近 Windows 32767 字符上限（长路径下 500 个已到 3 万字符）。
+ */
+const RECYCLE_BATCH = 200
+
+/**
+ * 同时回收的批数。⚠️ **实测 800 个文件（4 批 × 200）**：
+ * 串行 63.1s（78.9ms/文件）→ 并发 2 为 18.5s → **并发 4 为 11.6s（快 5.4 倍）**
+ * → 并发 8 为 10.3s（再翻倍几乎无收益）。
+ *
+ * 串行慢的原因不只是磁盘 IO：windows-trash.exe 每次启动都要初始化 COM 并逐文件
+ * 走 SHFileOperation，串行时这些固定成本无法摊薄，且单进程内是顺序执行。
+ */
+const RECYCLE_CONC = 6
+
+/** 并发跑批：返回失败（需要降级逐个重试）的批次。 */
+async function runBatches(
+  batches: string[][],
+  onBatch?: (paths: string[]) => void,
+  succeeded?: string[],
+): Promise<string[][]> {
+  const failed: string[][] = []
+  let cursor = 0
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const i = cursor++
+      if (i >= batches.length) return
+      const chunk = batches[i]
+      try {
+        await recycleManyViaExe(chunk)
+        // 退出码 0 = 整批成功：逐块回报进度，让「已删除 N 条」随动
+        onBatch?.(chunk)
+        if (succeeded) for (const p of chunk) succeeded.push(p)
+      } catch {
+        // 单批失败不影响其它批：先记下，全部跑完再统一降级重试
+        failed.push(chunk)
+      }
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(RECYCLE_CONC, batches.length) }, () => worker()),
+  )
+  return failed
+}
+
+/**
+ * 批量把多个文件移入回收站。
+ *
+ * 主路径：windows-trash.exe 支持多参数，按 200 一批、**多批并发 6**，绝大多数场景
+ * 一次进程搞定（exit 0 即全部成功），进程数从 N 降到 ⌈N/200⌉ 且并行执行。
+ *
+ * 降级：某批 exe 失败时（偶发占用 / exe 系统性失效），用 `existsSync` 区分哪些已
+ * 被批量调用悄悄移走（算成功），仅对仍留在原位置的逐个走 `moveToRecycleBin`
+ * （exe 单条 + PowerShell 兜底）。这样既不丢进度/审计，又避免对「已成功」文件
+ * 重复删除而误报失败。
+ */
+export async function moveManyToRecycleBin(
+  filePaths: string[],
+  onBatch?: (paths: string[]) => void,
+): Promise<BatchRecycleResult> {
+  const succeeded: string[] = []
+  const failed: BatchRecycleFailure[] = []
+  if (!filePaths.length) return { succeeded, failed }
+
+  // 主路径：批量 exe + 多批并发
+  if (!exeUnavailable) {
+    const batches = chunkArray(filePaths, RECYCLE_BATCH)
+    const bad = await runBatches(batches, onBatch, succeeded)
+    if (bad.length) {
+      // 只有失败的批需要降级（而非全量），失败面被限制在最小范围
+      exeFailCount += bad.length
+      if (exeFailCount >= EXE_FAIL_LIMIT) exeUnavailable = true
+      console.warn(
+        '[trash-bin] ' + bad.length + '/' + batches.length + ' batch(es) failed, fallback per-item',
+      )
+      for (const p of await fallbackPerItem(bad.flat(), onBatch, succeeded)) failed.push(p)
+    }
+    return { succeeded, failed }
+  }
+
+  for (const p of await fallbackPerItem(filePaths, onBatch, succeeded)) failed.push(p)
+  return { succeeded, failed }
+}
+
+/**
+ * 降级：逐条确认。已不在原位置的算成功；仍在的用单条 `moveToRecycleBin` 重试
+ * （exe 单条 + PowerShell 兜底）。返回最终失败项。
+ */
+async function fallbackPerItem(
+  paths: string[],
+  onBatch?: (paths: string[]) => void,
+  succeeded?: string[],
+): Promise<BatchRecycleFailure[]> {
+  const failed: BatchRecycleFailure[] = []
+  for (const p of paths) {
+    let exists = false
+    try {
+      exists = fs.existsSync(p)
+    } catch {
+      exists = false
+    }
+    if (!exists) {
+      succeeded?.push(p)
+      onBatch?.([p])
+      continue
+    }
+    try {
+      await moveToRecycleBin(p)
+      succeeded?.push(p)
+      onBatch?.([p])
+    } catch (err) {
+      failed.push({
+        path: p,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
+  return failed
+}
+
+/**
+ * 预热 windows-trash.exe：用一个不存在的路径空跑一次，触发防病毒/系统对二进制
+ * 的首次扫描与文件缓存，把「冷启动耗时」（dev 下未签名 exe 常被实时扫描，单次可
+ * 达十余秒）挪到应用开屏阶段，使真正删除时不再卡在进程启动上。
+ * 非阻塞、忽略结果（空跑必然「文件不存在」，属预期）。
+ */
+export function warmTrashExe(): void {
+  try {
+    const exe = exePath()
+    execFile(exe, ['C:\\__grclean_warmup_dummy__.tmp'], () => {
+      /* 忽略：空跑必失败，仅用于预热 */
+    })
+  } catch {
+    /* exe 缺失则跳过，不影响后续回收站逻辑 */
+  }
 }

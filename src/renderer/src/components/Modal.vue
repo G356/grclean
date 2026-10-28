@@ -178,9 +178,10 @@ watch(
 }
 .modal-head h3 {
   margin: 0;
-  font-size: calc(16px * var(--fs-scale));
+  font-size: calc(15px * var(--fs-scale));
   font-weight: 600;
   color: var(--title);
+  letter-spacing: 0.01em;
 }
 .modal-x {
   border: none;
@@ -197,11 +198,42 @@ watch(
   color: var(--text);
 }
 .modal-body {
-  padding: 16px 18px;
+  padding: 18px 20px;
   overflow-y: auto;
   /* 固定高度模式下占据剩余空间，高度由内容决定时也无害 */
   flex: 1 1 auto;
   min-height: 0;
+  /* 弹窗正文基础排版：统一字号与行距，避免各视图裸 <p> 继承浏览器默认 16px 过大。
+     因 slot 内容属于父视图，scoped 样式无法直接命中，需用 :deep() 下钻。 */
+  font-size: calc(13.5px * var(--fs-scale));
+  line-height: 1.65;
+  color: var(--text);
+}
+/* ↓ 以下规则作用于 slot 传入的内容（父视图所有），统一 Modal 内文字观感 */
+.modal-body :deep(p) {
+  margin: 0 0 10px;
+  line-height: 1.65;
+}
+.modal-body :deep(p:last-child) {
+  margin-bottom: 0;
+}
+.modal-body :deep(.muted) {
+  color: var(--muted);
+}
+.modal-body :deep(b),
+.modal-body :deep(strong) {
+  font-weight: 600;
+}
+.modal-body :deep(ul) {
+  margin: 0 0 10px;
+  padding-left: 20px;
+}
+.modal-body :deep(li) {
+  margin: 3px 0;
+  line-height: 1.6;
+}
+.modal-body :deep(a) {
+  color: var(--primary);
 }
 .modal-foot {
   display: flex;

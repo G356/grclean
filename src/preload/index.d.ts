@@ -137,6 +137,7 @@ export interface GrCleanApi {
     minMb: number,
     includeAll: boolean,
     onItem: (item: BigFileEntry) => void,
+    onProgress?: (n: number) => void,
   ): Promise<BigFileEntry[]>
   scanDuplicates(
     minMb: number,
@@ -147,6 +148,7 @@ export interface GrCleanApi {
   scanStartup(onItem: (item: StartupEntry) => void): Promise<StartupEntry[]>
   scanUninstall(
     onItem: (item: UninstallEntry) => void,
+    onIcon?: (id: string, icon: string) => void,
   ): Promise<UninstallEntry[]>
   scanRegistry(
     onItem: (item: RegistryEntry) => void,
@@ -158,6 +160,11 @@ export interface GrCleanApi {
   ): Promise<{ ok: boolean; error: string | null }>
   cancelScan(): void
   deleteDuplicates(ids: string[], purge: boolean): Promise<CleanResult>
+  deleteSocial(
+    ids: string[],
+    purge: boolean,
+    onProgress?: (ev: { type: 'items'; ids: string[] }) => void,
+  ): Promise<CleanResult>
   clean(
     ids: string[] | null,
     purge: boolean,
@@ -179,6 +186,12 @@ export interface GrCleanApi {
   listPrivacyRules(): Promise<PrivacyRuleOption[]>
   runPrivacyNow(ruleIds: string[] | null): Promise<CleanResult>
   getVersion(): Promise<string>
+  /** 当前是否处于「经典（完整）右键菜单」模式。 */
+  getClassicMenuState(): Promise<boolean>
+  /** 切换经典 / Win11 右键菜单；需重启资源管理器或注销后生效。 */
+  setClassicMenu(enabled: boolean): Promise<{ ok: boolean; message: string }>
+  /** 重启资源管理器，使右键菜单改动立即生效（会关闭已打开的文件夹窗口）。 */
+  restartExplorer(): Promise<{ ok: boolean; message: string }>
   windowControls: {
     minimize(): void
     toggleMaximize(): void

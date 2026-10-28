@@ -83,6 +83,9 @@ import {
   scanShellIconsStream,
   deleteShellIcons,
   backupDir as ctxBackupDir,
+  getClassicMenuEnabled,
+  setClassicMenuEnabled,
+  restartExplorer,
   type ContextMenuItem,
   type ShellIconItem,
 } from '../engine/contextmenu'
@@ -296,6 +299,8 @@ export function registerHandlers(win: BrowserWindow): void {
             minSize: Math.max(payload.minMb, 1) * 1024 * 1024,
             includeAll: payload.includeAll,
             drive: payload.drive,
+            onScanned: (n) =>
+              win.webContents.send('scan-bigfiles', { type: 'progress', scanned: n }),
           },
           () => appState.cancel,
         )) {
@@ -348,16 +353,25 @@ export function registerHandlers(win: BrowserWindow): void {
         payload.ids,
       )
 
+      // 若本次同时勾选了「回收站清理」与「普通垃圾」，说明用户意图是彻底清理：
+      // 普通垃圾直接永久删除（不进回收站），避免「刚移入回收站、又被回收站清理一起清掉」的语义矛盾。
+      // 仅勾普通垃圾（未勾回收站清理）时仍保持默认的可还原移入回收站行为。
+      const forcePurge =
+        recycleIds.length > 0 && (fileIds.length > 0 || payload.ids === null)
+      const effectivePurge = forcePurge ? true : payload.purge
+
       const result =
         fileIds.length || payload.ids === null
-          ? await deleteCandidates(session.candidates, payload.ids === null ? null : fileIds, payload.purge, {
+          ? await deleteCandidates(session.candidates, payload.ids === null ? null : fileIds, effectivePurge, {
               allowSystemPrefixes,
-              // 每成功删除一项即推送进度：前端实时移除列表项并累计「已删除 N 条」
-              onDeleted: (c) => {
-                win.webContents.send('clean:progress', {
-                  type: 'items',
-                  ids: [c.id],
-                })
+              // 每成功删除一批即推送进度（批量数组，降低重渲染开销）：前端实时移除列表项并累计「已删除 N 条」
+              onDeleted: (items) => {
+                if (items.length) {
+                  win.webContents.send('clean:progress', {
+                    type: 'items',
+                    ids: items.map((i) => i.id),
+                  })
+                }
               },
             })
           : emptyResult()
@@ -406,7 +420,7 @@ export function registerHandlers(win: BrowserWindow): void {
           if (logged.length) logDeletion(logged, true)
         }
       }
-      return result
+      return toCloneable(result) as CleanResult
     },
   )
 
@@ -454,6 +468,35 @@ export function registerHandlers(win: BrowserWindow): void {
     win.webContents.send('scan-duplicates', { type: 'done', result: sorted })
   })
 
+  /**
+   * 把任意值转成「结构化可克隆」的安全副本，保证 IPC 返回永远不会因为混入
+   * Map / Set / function / Date / Buffer / 循环引用等不可克隆对象而抛
+   * 「An object could not be cloned.」（该错误会让前端 invoke 直接 reject，且看不到真实原因）。
+   * 递归剥离：原始类型原样返回，其它非对象类型降级为字符串，对象/数组保留结构。
+   */
+  function toCloneable(value: unknown, seen = new WeakSet<object>()): unknown {
+    if (value === null || value === undefined) return value
+    const t = typeof value
+    if (t === 'string' || t === 'number' || t === 'boolean') return value
+    if (t !== 'object') return String(value) // function / symbol / bigint 等
+    if (seen.has(value)) return null // 循环引用
+    seen.add(value)
+    if (value instanceof Date) return value.toISOString()
+    if (value instanceof Error) return value.message
+    if (Array.isArray(value)) return value.map((v) => toCloneable(v, seen))
+    if (value instanceof Map)
+      return Array.from(value.entries()).map(([k, v]) => ({
+        k: String(k),
+        v: toCloneable(v, seen),
+      }))
+    if (value instanceof Set) return Array.from(value, (v) => toCloneable(v, seen))
+    const out: Record<string, unknown> = {}
+    for (const key of Object.keys(value as Record<string, unknown>)) {
+      out[key] = toCloneable((value as Record<string, unknown>)[key], seen)
+    }
+    return out
+  }
+
   // 删除指定重复文件（安全删除：受保护路径拦截 + 默认回收站 + 审计）
   ipcMain.handle(
     'delete-duplicates',
@@ -461,16 +504,54 @@ export function registerHandlers(win: BrowserWindow): void {
       _e,
       payload: { ids: string[]; purge: boolean },
     ): Promise<CleanResult> => {
-      const session = appState.dupSession
-      if (!session) {
-        return {
+      try {
+        const session = appState.dupSession
+        if (!session) {
+          console.log('[dup] delete-duplicates: no dupSession (请先扫描)')
+          return {
+            deleted_count: 0,
+            deleted_size: 0,
+            skipped: [],
+            errors: ['没有可删除的重复文件，请先执行重复扫描'],
+          }
+        }
+        const resolved = payload.ids.filter((id) => session.candidates.has(id)).length
+        console.log(
+          `[dup] delete-duplicates: ids=${payload.ids.length} resolved=${resolved} purge=${payload.purge}`,
+        )
+        const res = await deleteCandidates(session.candidates, payload.ids, payload.purge, {
+          // 回收站模式失效时兜底直接删除，确保「确认删除」一定兑现（不会整批不动）
+          fallbackToPurge: !payload.purge,
+        })
+        console.log(
+          `[dup] delete-duplicates result: deleted=${res.deleted_count} skipped=${res.skipped.length} errors=${res.errors.length}`,
+        )
+        if (res.errors.length) console.log('[dup] delete errors:', res.errors.slice(0, 5))
+        if (res.skipped.length) console.log('[dup] delete skipped:', res.skipped.slice(0, 5))
+        // 防御性清洗：IPC 返回必须是可结构化克隆的纯数据，杜绝「An object could not be cloned.」
+        // （任何非原始类型 / Map / 函数混入都会被剥离为字符串，保证 invoke 一定能解析）
+        return toCloneable({
+          deleted_count: res.deleted_count,
+          deleted_size: res.deleted_size,
+          skipped: (res.skipped ?? []).map((s) => ({
+            id: String(s.id),
+            path: String(s.path),
+            reason: String(s.reason),
+          })),
+          errors: (res.errors ?? []).map(String),
+          notes: (res.notes ?? []).map(String),
+        }) as CleanResult
+      } catch (e) {
+        // 任何内部异常都转成纯字符串错误返回，绝不以不可克隆对象 reject（否则前端收到
+        // 「An object could not be cloned.」且看不到真实原因）。真实错误原文打到主进程日志。
+        console.error('[dup] delete-duplicates failed:', e)
+        return toCloneable({
           deleted_count: 0,
           deleted_size: 0,
           skipped: [],
-          errors: ['没有可删除的重复文件，请先执行重复扫描'],
-        }
+          errors: [`删除失败：${e instanceof Error ? e.message : String(e)}`],
+        }) as CleanResult
       }
-      return deleteCandidates(session.candidates, payload.ids, payload.purge)
     },
   )
 
@@ -513,11 +594,15 @@ export function registerHandlers(win: BrowserWindow): void {
   )
 
   // 已安装程序：流式扫描（与「程序和功能」同源）
+  // 条目边扫边推；图标异步提取，取到一个就单独推一次 uninstall:icon（不阻塞列表）
   ipcMain.on('scan-uninstall:start', async () => {
     appState.resetCancel()
     const all: import('../engine/model').UninstallEntry[] = []
+    const sendIcon = (id: string, icon: string): void => {
+      if (!win.isDestroyed()) win.webContents.send('uninstall:icon', { id, icon })
+    }
     try {
-      for await (const batch of scanUninstallStream(() => appState.cancel)) {
+      for await (const batch of scanUninstallStream(() => appState.cancel, sendIcon)) {
         win.webContents.send('scan-uninstall', { type: 'item', items: batch })
         all.push(...batch)
       }
@@ -528,6 +613,8 @@ export function registerHandlers(win: BrowserWindow): void {
       })
       return
     }
+    // 流式期间是注册表枚举顺序，收尾统一按名称排序再作为权威结果返回
+    all.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()))
     win.webContents.send('scan-uninstall', { type: 'done', result: all })
   })
 
@@ -855,7 +942,11 @@ export function registerHandlers(win: BrowserWindow): void {
     appState.resetCancel()
     const all: SocialItem[] = []
     try {
-      for await (const batch of scanSocialStream(() => appState.cancel)) {
+      for await (
+        const batch of scanSocialStream(() => appState.cancel, (scanned) =>
+          win.webContents.send('scan-social:progress', { scanned }),
+        )
+      ) {
         win.webContents.send('scan-social', { type: 'item', items: batch })
         all.push(...batch)
       }
@@ -885,7 +976,20 @@ export function registerHandlers(win: BrowserWindow): void {
     async (_e, payload: { ids: string[]; purge?: boolean }): Promise<CleanResult> => {
       const session = appState.socialSession
       if (!session) return emptyResult()
-      return deleteSocialItems(session.items, payload?.ids ?? [], !!payload?.purge)
+      return deleteSocialItems(
+        session.items,
+        payload?.ids ?? [],
+        !!payload?.purge,
+        // 每成功删除一批即推送进度（文件路径数组），前端实时累计「已删除 N 项」
+        (paths) => {
+          if (paths.length) {
+            win.webContents.send('delete-social:progress', {
+              type: 'items',
+              ids: paths,
+            })
+          }
+        },
+      )
     },
   )
 
@@ -961,6 +1065,7 @@ export function registerHandlers(win: BrowserWindow): void {
           payload?.minDays ?? 30,
           () => appState.cancel,
           payload?.drive ?? '',
+          (n) => win.webContents.send('scan-installers', { type: 'progress', scanned: n }),
         )) {
           win.webContents.send('scan-installers', { type: 'item', items: batch })
           all.push(...batch)
@@ -1005,6 +1110,7 @@ export function registerHandlers(win: BrowserWindow): void {
           payload?.minDays ?? 0,
           payload?.drive ?? '',
           () => appState.cancel,
+          (n) => win.webContents.send('scan-logs', { type: 'progress', scanned: n }),
         )) {
         win.webContents.send('scan-logs', { type: 'item', items: batch })
         all.push(...batch)
@@ -1099,6 +1205,50 @@ export function registerHandlers(win: BrowserWindow): void {
   ipcMain.handle('ctx:backup-dir', async (): Promise<string> => {
     return ctxBackupDir()
   })
+
+  // 经典 / Win11 右键菜单切换（§3.13 补充）：HKCU 当前用户，无需管理员。
+  ipcMain.handle('ctx:classic-state', async (): Promise<boolean> => {
+    return getClassicMenuEnabled()
+  })
+
+  // 重启资源管理器：使右键菜单改动立即生效（explorer 会缓存 CLSID 判定）。
+  ipcMain.handle(
+    'ctx:restart-explorer',
+    async (): Promise<{ ok: boolean; message: string }> => {
+      try {
+        await restartExplorer()
+        return { ok: true, message: '资源管理器已重启' }
+      } catch (e) {
+        return {
+          ok: false,
+          message: e instanceof Error ? e.message : String(e),
+        }
+      }
+    },
+  )
+
+  ipcMain.handle(
+    'ctx:classic-set',
+    async (
+      _e,
+      payload: { enabled: boolean },
+    ): Promise<{ ok: boolean; message: string }> => {
+      try {
+        await setClassicMenuEnabled(!!payload?.enabled)
+        return {
+          ok: true,
+          message: payload?.enabled
+            ? '已恢复到经典右键菜单'
+            : '已切回 Win11 右键菜单',
+        }
+      } catch (e) {
+        return {
+          ok: false,
+          message: e instanceof Error ? e.message : String(e),
+        }
+      }
+    },
+  )
 
   // ---------------- 驱动清理（§3.14）----------------
   ipcMain.on('drivers:scan:start', async () => {
@@ -1196,10 +1346,16 @@ export function registerHandlers(win: BrowserWindow): void {
   ipcMain.on('migrate:list:start', async (_e, payload: { minMb?: number }) => {
     appState.resetCancel()
     const all: MigrateItem[] = []
+    const sendProgress = (done: number, total: number): void => {
+      if (!win.isDestroyed()) {
+        win.webContents.send('migrate:list:progress', { done, total })
+      }
+    }
     try {
       for await (const batch of listMigratableStream(
         payload?.minMb ?? 200,
         () => appState.cancel,
+        sendProgress,
       )) {
         win.webContents.send('migrate:list', { type: 'item', items: batch })
         all.push(...batch)

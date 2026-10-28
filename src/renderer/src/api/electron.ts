@@ -33,6 +33,7 @@ export interface CleanResult {
   deleted_size: number;
   skipped: SkippedItem[];
   errors: string[];
+  notes?: string[];
 }
 
 export interface BigFileEntry {
@@ -71,6 +72,10 @@ export interface UninstallEntry {
   version: string;
   publisher: string;
   install_location: string;
+  /** 安装日期（YYYY-MM-DD，取不到则为空串） */
+  install_date: string;
+  /** 程序图标 data URL（取不到则为空串，前端显示占位图标） */
+  icon: string;
   /** EstimatedSize（KB） */
   size_kb: number;
   uninstall_string: string;
@@ -672,6 +677,7 @@ declare global {
         minMb: number,
         scope: string,
         onItem: (item: BigFileEntry) => void,
+        onProgress?: (n: number) => void,
       ): Promise<BigFileEntry[]>;
       scanDuplicates(
         minMb: number,
@@ -688,13 +694,21 @@ declare global {
       ): Promise<{ ok: boolean; error: string | null }>;
       scanUninstall(
         onItem: (item: UninstallEntry) => void,
+        onIcon?: (id: string, icon: string) => void,
       ): Promise<UninstallEntry[]>;
       scanRegistry(
         onItem: (item: RegistryEntry) => void,
       ): Promise<RegistryEntry[]>;
-      scanSocial(onItem: (item: SocialItem) => void): Promise<SocialItem[]>;
+      scanSocial(
+        onItem: (item: SocialItem) => void,
+        onProgress?: (scanned: number) => void,
+      ): Promise<SocialItem[]>;
       cancelScanSocial(): void;
-      deleteSocial(ids: string[], purge: boolean): Promise<CleanResult>;
+      deleteSocial(
+        ids: string[],
+        purge: boolean,
+        onProgress?: (ev: { type: 'items'; ids: string[] }) => void,
+      ): Promise<CleanResult>;
       listDisks(): Promise<DiskInfo[]>;
       listPhysicalDisks(): Promise<PhysicalDiskInfo[]>;
       smartOverview(deviceId: number): Promise<SmartRow[]>;
@@ -704,6 +718,7 @@ declare global {
         minDays: number,
         drive: string,
         onItem: (item: InstallerItem) => void,
+        onProgress?: (n: number) => void,
       ): Promise<InstallerItem[]>;
       cancelScanInstallers(): void;
       deleteInstallers(ids: string[], purge: boolean): Promise<CleanResult>;
@@ -711,6 +726,7 @@ declare global {
         minDays: number,
         drive: string,
         onItem: (item: LogItem) => void,
+        onProgress?: (n: number) => void,
       ): Promise<LogItem[]>;
       cancelScanLogs(): void;
       deleteLogs(ids: string[], purge: boolean): Promise<CleanResult>;
@@ -725,6 +741,12 @@ declare global {
       ): Promise<OpResult[]>;
       deleteContextMenu(ids: string[]): Promise<OpResult[]>;
       ctxBackupDir(): Promise<string>;
+      /** 当前是否处于「经典（完整）右键菜单」模式。 */
+      getClassicMenuState(): Promise<boolean>;
+      /** 切换经典 / Win11 右键菜单；需重启资源管理器或注销后生效。 */
+      setClassicMenu(enabled: boolean): Promise<{ ok: boolean; message: string }>;
+      /** 重启资源管理器，使右键菜单改动立即生效（会关闭已打开的文件夹窗口）。 */
+      restartExplorer(): Promise<{ ok: boolean; message: string }>;
       /** 在资源管理器中打开某文件 / 目录所在的目录。 */
       openPath(path: string): Promise<{ ok: boolean; error: string | null }>;
       /** 大文件 / 单文件：删除（默认移入回收站）。 */
@@ -737,6 +759,7 @@ declare global {
       listMigratable(
         minMb: number,
         onItem: (item: MigrateItem) => void,
+        onProgress?: (done: number, total: number) => void,
       ): Promise<MigrateItem[]>;
       listMigrateTargets(): Promise<MigrateTarget[]>;
       migrateDirectory(id: string, targetRoot: string): Promise<OpResult>;
@@ -867,9 +890,19 @@ export function scanRegistry(
   return window.api.scanRegistry(onItem);
 }
 
+/**
+ * 把可能带 Vue 响应式代理（reactive Proxy）的 id 列表，转成纯字符串数组。
+ * 关键：Vue ref/reactive 持有的数组是 Proxy，直接传给 ipcRenderer.invoke 会被
+ * 结构化克隆（structuredClone）拒绝，抛 "An object could not be cloned."，且主进程
+ * handler 根本不会执行。这里脱离响应式代理，保证 IPC 参数一定可克隆。
+ */
+function ipcIds(ids: string[]): string[] {
+  return ids.map((x) => String(x))
+}
+
 /** 删除选中的注册表项（先备份，再逐项校验删除）。 */
 export function deleteRegistry(ids: string[]): Promise<RegistryCleanResult> {
-  return window.api.deleteRegistry(ids);
+  return window.api.deleteRegistry(ipcIds(ids));
 }
 
 /** 列出注册表清理备份。 */
@@ -885,13 +918,15 @@ export function restoreRegistry(
 }
 
 /** 启动大文件分析，期间通过回调逐条（批）返回大文件，最终 resolve 降序结果。
- *  scope：''=用户目录；'all'=全部盘符；'C'/'D'…=指定盘符。 */
+ *  scope：''=用户目录；'all'=全部盘符；'C'/'D'…=指定盘符。
+ *  onProgress：可选，回推「已遍历文件总数」（含未达阈值的文件），用于展示扫描进度。 */
 export function scanBigFiles(
   minMb: number,
   scope: string,
   onItem: (item: BigFileEntry) => void,
+  onProgress?: (n: number) => void,
 ): Promise<BigFileEntry[]> {
-  return window.api.scanBigFiles(minMb, scope, onItem);
+  return window.api.scanBigFiles(minMb, scope, onItem, onProgress);
 }
 
 /** 启动重复文件扫描，期间逐组回调 + 周期上报哈希进度，最终 resolve 降序结果。 */
@@ -919,11 +954,15 @@ export function setStartupEnabled(
   return window.api.setStartupEnabled(id, enabled);
 }
 
-/** 扫描已安装程序，期间逐条回调，最终 resolve 权威结果。 */
+/**
+ * 扫描已安装程序：条目边扫边回调（onItem），图标异步取到后单独回调（onIcon），
+ * 最终 resolve 权威结果（已按名称排序、图标已填充）。
+ */
 export function scanUninstall(
   onItem: (item: UninstallEntry) => void,
+  onIcon?: (id: string, icon: string) => void,
 ): Promise<UninstallEntry[]> {
-  return window.api.scanUninstall(onItem);
+  return window.api.scanUninstall(onItem, onIcon);
 }
 
 /**
@@ -950,7 +989,10 @@ export function deleteDuplicates(
   ids: string[],
   purge: boolean,
 ): Promise<CleanResult> {
-  return window.api.deleteDuplicates(ids, purge);
+  // 关键修复：pendingIds.value 是 Vue reactive 代理数组，直接传给 ipcRenderer.invoke
+  // 会被结构化克隆（structuredClone）拒绝，报 "An object could not be cloned."，且主进程
+  // handler 根本不会执行。此处脱离响应式代理，转成纯字符串数组 + 纯布尔，确保可克隆。
+  return window.api.deleteDuplicates(ipcIds(ids), !!purge);
 }
 
 /**
@@ -963,7 +1005,7 @@ export function clean(
   purge: boolean,
   onProgress?: (ev: { type: 'items'; ids: string[] }) => void,
 ): Promise<CleanResult> {
-  return window.api.clean(ids, purge, onProgress);
+  return window.api.clean(ids == null ? null : ipcIds(ids), purge, onProgress);
 }
 
 /** 列出清理规则（内置 + 用户 JSON 规则）。 */
@@ -1117,8 +1159,9 @@ export function openExternal(url: string): Promise<boolean> {
 /** 社交缓存流式扫描（按应用分批回调）。 */
 export function scanSocial(
   onItem: (item: SocialItem) => void,
+  onProgress?: (scanned: number) => void,
 ): Promise<SocialItem[]> {
-  return window.api.scanSocial(onItem);
+  return window.api.scanSocial(onItem, onProgress);
 }
 
 /** 取消社交缓存扫描。 */
@@ -1130,8 +1173,9 @@ export function cancelScanSocial(): void {
 export function deleteSocial(
   ids: string[],
   purge: boolean,
+  onProgress?: (ev: { type: 'items'; ids: string[] }) => void,
 ): Promise<CleanResult> {
-  return window.api.deleteSocial(ids, purge);
+  return window.api.deleteSocial(ipcIds(ids), purge, onProgress);
 }
 
 /** 大文件 / 单文件：删除（默认移入回收站）。 */
@@ -1167,8 +1211,9 @@ export function scanInstallers(
   minDays: number,
   drive: string,
   onItem: (item: InstallerItem) => void,
+  onProgress?: (n: number) => void,
 ): Promise<InstallerItem[]> {
-  return window.api.scanInstallers(minSizeMb, minDays, drive, onItem);
+  return window.api.scanInstallers(minSizeMb, minDays, drive, onItem, onProgress);
 }
 
 /** 取消安装包扫描。 */
@@ -1181,7 +1226,7 @@ export function deleteInstallers(
   ids: string[],
   purge: boolean,
 ): Promise<CleanResult> {
-  return window.api.deleteInstallers(ids, purge);
+  return window.api.deleteInstallers(ipcIds(ids), purge);
 }
 
 /** 日志流式扫描。drive：'' / 'all' = 所有盘符；'C'/'D'… = 仅该盘符下的用户日志。 */
@@ -1189,8 +1234,9 @@ export function scanLogs(
   minDays: number,
   drive: string,
   onItem: (item: LogItem) => void,
+  onProgress?: (n: number) => void,
 ): Promise<LogItem[]> {
-  return window.api.scanLogs(minDays, drive, onItem);
+  return window.api.scanLogs(minDays, drive, onItem, onProgress);
 }
 
 /** 取消日志扫描。 */
@@ -1200,7 +1246,7 @@ export function cancelScanLogs(): void {
 
 /** 删除日志条目（系统关键日志由后端 isProtected 拦截）。 */
 export function deleteLogs(ids: string[], purge: boolean): Promise<CleanResult> {
-  return window.api.deleteLogs(ids, purge);
+  return window.api.deleteLogs(ipcIds(ids), purge);
 }
 
 /** 生成 C 盘瘦身方案（只统计，不改任何东西）。 */
@@ -1230,12 +1276,29 @@ export function setContextMenuDisabled(
 
 /** 删除右键菜单项（删除前自动导出 .reg 备份）。 */
 export function deleteContextMenu(ids: string[]): Promise<OpResult[]> {
-  return window.api.deleteContextMenu(ids);
+  return window.api.deleteContextMenu(ipcIds(ids));
 }
 
 /** 右键菜单备份目录。 */
 export function ctxBackupDir(): Promise<string> {
   return window.api.ctxBackupDir();
+}
+
+/** 当前是否处于「经典（完整）右键菜单」模式。 */
+export function getClassicMenuState(): Promise<boolean> {
+  return window.api.getClassicMenuState();
+}
+
+/** 切换经典 / Win11 右键菜单；需重启资源管理器或注销后生效。 */
+export function setClassicMenu(
+  enabled: boolean,
+): Promise<{ ok: boolean; message: string }> {
+  return window.api.setClassicMenu(enabled);
+}
+
+/** 重启资源管理器，使右键菜单改动立即生效（会关闭已打开的文件夹窗口）。 */
+export function restartExplorer(): Promise<{ ok: boolean; message: string }> {
+  return window.api.restartExplorer();
 }
 
 /** 扫描驱动存储库，期间逐条回调；返回结果数组与采集诊断 note。 */
@@ -1248,15 +1311,18 @@ export function scanDrivers(
 
 /** 删除孤立驱动包（需管理员，仅删无设备使用者）。 */
 export function deleteDrivers(ids: string[]): Promise<OpResult[]> {
-  return window.api.deleteDrivers(ids);
+  return window.api.deleteDrivers(ipcIds(ids));
 }
 
-/** 列出可迁移目录，期间逐条回调。 */
+/**
+ * 列出可迁移目录：逐条回调（onItem），并回吐「已统计目录数 / 候选总数」（onProgress）。
+ */
 export function listMigratable(
   minMb: number,
   onItem: (item: MigrateItem) => void,
+  onProgress?: (done: number, total: number) => void,
 ): Promise<MigrateItem[]> {
-  return window.api.listMigratable(minMb, onItem);
+  return window.api.listMigratable(minMb, onItem, onProgress);
 }
 
 /** 列出可用目标盘符。 */
@@ -1296,7 +1362,7 @@ export function deleteResidue(
   ids: string[],
   purge: boolean,
 ): Promise<CleanResult> {
-  return window.api.deleteResidue(ids, purge);
+  return window.api.deleteResidue(ipcIds(ids), purge);
 }
 
 /** 扫描「此电脑」外壳图标（命名空间扩展），期间逐条回调。 */
@@ -1308,7 +1374,7 @@ export function scanShellIcons(
 
 /** 移除外壳图标（删除前导出 .reg 备份；系统内置 GUID 会被后端拒绝）。 */
 export function deleteShellIcons(ids: string[]): Promise<OpResult[]> {
-  return window.api.deleteShellIcons(ids);
+  return window.api.deleteShellIcons(ipcIds(ids));
 }
 
 /** 读取磁盘优化四项状态。 */
@@ -1508,6 +1574,9 @@ export function assertApiKeys(): void {
     "setContextMenuDisabled",
     "deleteContextMenu",
     "ctxBackupDir",
+    "getClassicMenuState",
+    "setClassicMenu",
+    "restartExplorer",
     "openPath",
     "scanDrivers",
     "deleteDrivers",
@@ -1650,4 +1719,86 @@ export function getCachedDisks(): DiskInfo[] {
 /** 缓存盘符列表。 */
 export function setCachedDisks(disks: DiskInfo[]): void {
   setLocal(DISK_CACHE_KEY, JSON.stringify(disks));
+}
+
+// ---------------------------------------------------------------------------
+// 共享盘符预加载（单例 Promise 缓存）
+// ---------------------------------------------------------------------------
+// 设计：盘符（卷）与物理磁盘的读取走 PowerShell，首次进入各扫描页会卡几秒。
+// 改为「模块级单例 + 启动时预热」：所有需要盘符的视图共享同一个 Promise，
+// App 启动即后台静默读取，视图进入时若已就绪则瞬时填充，无需等待。
+// 失败则回退到本地缓存（getCachedDisks），避免下拉被清空；并允许下次重试。
+
+/** 卷（盘符）列表：单例 Promise；首次读后缓存，后续复用同一结果。 */
+let disksPromise: Promise<DiskInfo[]> | null = null;
+
+/** 卷（盘符）列表：保证已加载（即时返回缓存或正在进行的读取）。 */
+export function ensureDisksLoaded(): Promise<DiskInfo[]> {
+  if (!disksPromise) {
+    disksPromise = listDisks()
+      .then((list) => {
+        setCachedDisks(list);
+        return list;
+      })
+      .catch((e) => {
+        disksPromise = null;
+        const cached = getCachedDisks();
+        if (cached.length) return cached;
+        throw e;
+      });
+  }
+  return disksPromise;
+}
+
+/** 主动刷新卷（盘符）列表：清空缓存 Promise 后重新读取。 */
+export function refreshDisks(): Promise<DiskInfo[]> {
+  disksPromise = null;
+  return ensureDisksLoaded();
+}
+
+/** 物理磁盘列表：单例 Promise。 */
+let physicalPromise: Promise<PhysicalDiskInfo[]> | null = null;
+
+/** 物理磁盘列表：保证已加载（即时返回缓存或正在进行的读取）。 */
+export function ensurePhysicalDisksLoaded(): Promise<PhysicalDiskInfo[]> {
+  if (!physicalPromise) {
+    physicalPromise = listPhysicalDisks().catch((e) => {
+      physicalPromise = null;
+      throw e;
+    });
+  }
+  return physicalPromise;
+}
+
+/** 主动刷新物理磁盘列表：清空缓存 Promise 后重新读取。 */
+export function refreshPhysicalDisks(): Promise<PhysicalDiskInfo[]> {
+  physicalPromise = null;
+  return ensurePhysicalDisksLoaded();
+}
+
+/**
+ * 物理磁盘 + 卷 组合（磁盘优化页用）：基于上述两个单例构建，
+ * 不重复读取卷，避免与 ensureDisksLoaded 各读一遍。
+ */
+let physVolPromise: Promise<{
+  physicals: PhysicalDiskInfo[];
+  volumes: Array<{ letter: string; system: boolean }>;
+}> | null = null;
+
+export function ensurePhysicsVolumesLoaded() {
+  if (!physVolPromise) {
+    physVolPromise = Promise.all([
+      ensurePhysicalDisksLoaded(),
+      ensureDisksLoaded(),
+    ])
+      .then(([physicals, volumes]) => ({
+        physicals,
+        volumes: volumes.map((d) => ({ letter: d.letter, system: d.system })),
+      }))
+      .catch((e) => {
+        physVolPromise = null;
+        throw e;
+      });
+  }
+  return physVolPromise;
 }

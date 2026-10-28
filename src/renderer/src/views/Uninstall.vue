@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { PackageX, SearchX } from "@lucide/vue";
+import { PackageX, SearchX, Package } from "@lucide/vue";
 import { ref, computed } from "vue";
 import {
   scanUninstall,
@@ -23,6 +23,8 @@ type TabKey = "app" | "residue";
 const tab = ref<TabKey>("app");
 
 const entries = ref<UninstallEntry[]>([]);
+/** 异步到达的程序图标（id → data URL）；扫描期间条目先出现，图标后到达 */
+const icons = ref<Record<string, string>>({});
 const loading = ref(false);
 /** 是否已执行过一次扫描（区分「暂未扫描」与「已扫描无结果」两种空态） */
 const scanned = ref(false);
@@ -55,14 +57,20 @@ async function doScan() {
   error.value = "";
   entries.value = [];
   try {
-    // 后端逐条发送已安装程序（从上方插入），前端边扫边显示；seen 去重（O(n²) → O(n)）
+    icons.value = {};
+    // 后端边扫边发（从上方插入），前端逐条显示；seen 去重（O(n²) → O(n)）
     const seen = new Set<string>();
-    entries.value = await scanUninstall((item) => {
-      if (!seen.has(item.id)) {
-        seen.add(item.id);
-        entries.value.unshift(item);
-      }
-    });
+    entries.value = await scanUninstall(
+      (item) => {
+        if (!seen.has(item.id)) {
+          seen.add(item.id);
+          entries.value.unshift(item);
+        }
+      },
+      (id, icon) => {
+        if (icon) icons.value[id] = icon;
+      },
+    );
     void recordScan('uninstall', `${entries.value.length} 个 · ${formatSize(totalSize.value * 1024)}`);
   } catch (e: any) {
     error.value = String(e);
@@ -98,10 +106,6 @@ async function confirmUninstall() {
   } finally {
     busyId.value = "";
   }
-}
-
-function truncate(s: string, n = 70) {
-  return s.length > n ? s.slice(0, n) + "…" : s;
 }
 
 // ---------------- 卸载残留（§3.11）----------------
@@ -224,13 +228,19 @@ async function doDeleteResidue() {
       </div>
 
       <div v-if="error" class="err">{{ error }}</div>
-      <div v-if="lastResult && lastResult.launched" class="ok">
-        已启动卸载程序：<code>{{ truncate(lastResult.command, 120) }}</code>
-      </div>
 
       <div v-if="filtered.length" class="list fill-list">
         <!-- v-memo：卸载请求仅影响当前行 -->
-        <div v-for="e in filtered" :key="e.id" v-memo="[e, busyId]" class="row">
+        <div v-for="e in filtered" :key="e.id" v-memo="[e, busyId, icons[e.id]]" class="row">
+          <div class="app-icon">
+            <img
+              v-if="icons[e.id] || e.icon"
+              :src="icons[e.id] || e.icon"
+              alt=""
+              draggable="false"
+            />
+            <Package v-else :size="22" class="icon-ph" />
+          </div>
           <div class="info">
             <div class="name">
               {{ e.name }}
@@ -238,6 +248,7 @@ async function doDeleteResidue() {
             </div>
             <div class="meta muted">
               <span v-if="e.publisher">{{ e.publisher }}</span>
+              <span v-if="e.install_date">· {{ e.install_date }}</span>
               <span v-if="e.size_kb">· {{ formatSize(e.size_kb * 1024) }}</span>
             </div>
             <div class="loc muted" :title="e.install_location">
@@ -480,8 +491,31 @@ async function doDeleteResidue() {
   gap: 10px;
   flex-shrink: 0;
 }
+/* 程序图标：顶部对齐（不随整行垂直居中），取不到图标时用占位图标保持行高一致 */
+.app-icon {
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  /* .row 是 align-items:center，这里单独吸顶，使图标与首行文字顶部齐平 */
+  align-self: flex-start;
+  padding-top: 1px;
+}
+.app-icon img {
+  width: 28px;
+  height: 28px;
+  object-fit: contain;
+  image-rendering: auto;
+}
+.icon-ph {
+  color: var(--muted);
+  opacity: 0.5;
+}
 .info {
   min-width: 0;
+  flex: 1;
 }
 /* 卸载残留行：勾选框 + 文本两项，让文本占满剩余宽度并左对齐（不居中/不右推）；
    勾选框与首行文字顶部对齐（flex-start），不随多行内容垂直居中 */

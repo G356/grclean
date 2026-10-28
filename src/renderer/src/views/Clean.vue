@@ -89,16 +89,9 @@ const grouped = computed(() => {
     g.size += c.size
     g.items.push(c)
   }
+  // 保持扫描期的自然顺序（分类按首次出现的先后、列表按流式追加顺序），
+  // 不在扫描完成时做多余排序；Map 的插入序即 candidates 的遍历序。
   const list = Array.from(byCat.values())
-  // 分类顺序：沿用上一轮（result）的分类次序，新出现的分类排在后面
-  const order = result.value?.categories.map((c) => c.category) ?? []
-  if (order.length > 1) {
-    const rank = (cat: string) => {
-      const i = order.indexOf(cat)
-      return i < 0 ? Number.MAX_SAFE_INTEGER : i
-    }
-    list.sort((a, b) => rank(a.category) - rank(b.category))
-  }
   return list
 })
 // 有结果的分类（count>0）才显示：分类导航条与结果列表都只展示有内容的分类。
@@ -150,7 +143,13 @@ async function doScan() {
     })
     result.value = res
     cancelled.value = res.cancelled
-    candidates.value = res.candidates
+    // 保持扫描期间的显示顺序，不在完成时重排：
+    // 用权威结果对象覆盖数据，但按「扫描期候选的 id 顺序」重组，避免完成瞬间列表/分类跳动。
+    const prevOrder = candidates.value.map((c) => c.id)
+    const byId = new Map(res.candidates.map((c) => [c.id, c]))
+    candidates.value = prevOrder
+      .map((id) => byId.get(id))
+      .filter((c): c is CleanCandidate => !!c)
     void recordScan('junk', `${totalCount.value} 项 · ${formatSize(totalSize.value)}`)
   } catch (e: any) {
     error.value = String(e)
@@ -208,6 +207,7 @@ function deleteOne(id: string) {
 
 // ---- 分类导航条（横向滚动：按住拖动 + 左右箭头 + 点击定位结果列表对应分类） ----
 const stripRef = ref<HTMLElement | null>(null)
+const listRef = ref<HTMLElement | null>(null)
 const activeCat = ref('')
 const stripDown = ref(false)
 const stripDragged = ref(false)
@@ -264,11 +264,49 @@ function onStripClick(cat: string, e: MouseEvent) {
   }
   scrollToCategory(cat)
 }
-/** 点击分类：高亮并滚动结果列表到对应分组 */
+/**
+ * 点击分类：高亮并滚动结果列表到对应分组。
+ * 根因：列表行带 content-visibility:auto，未渲染分组的高度是「固有估计值」，
+ * 据此算出的落点会严重偏离真实位置（曾出现点击回收站却跳到着色器）。
+ * 且 scrollIntoView / 固定延时校正会在平滑滚动「中途」读取位置、被动画打断而落错。
+ * 解法：滚动 .fill-list 到估计位置，待真正的滚动结束事件（scrollend，此时沿途
+ * content-visibility 已渲染、真实高度确定）再读真实布局精确校正一次。
+ * Chromium 120+(Electron 28) 支持 scrollend；不支持时用超时兜底。
+ * scrollToken 防止连续点击时校正互相打架。
+ */
+let scrollToken = 0
 function scrollToCategory(cat: string) {
   activeCat.value = cat
+  const listEl = listRef.value
   const el = groupEls[cat]
-  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  if (!listEl || !el) return
+  const myToken = ++scrollToken
+  let corrected = false
+  const correct = () => {
+    if (myToken !== scrollToken || corrected) return
+    // 元素相对列表顶部的真实偏移：dist>0 表示标题在列表顶部之下，需继续向下滚 dist 才能贴顶
+    const dist =
+      el.getBoundingClientRect().top - listEl.getBoundingClientRect().top
+    if (Math.abs(dist) > 2) {
+      listEl.scrollTo({ top: listEl.scrollTop + dist, behavior: 'auto' })
+    }
+    corrected = true
+  }
+  const onScrollEnd = () => {
+    listEl.removeEventListener('scrollend', onScrollEnd)
+    correct()
+  }
+  // Chromium 120+(Electron 28) 支持 scrollend；否则用超时兜底
+  if ('onscrollend' in listEl) {
+    listEl.addEventListener('scrollend', onScrollEnd)
+  } else {
+    window.setTimeout(correct, 700)
+  }
+  const listRect = listEl.getBoundingClientRect()
+  // 目标分组相对列表内容顶部的绝对偏移（基于当前布局，不依赖 offsetParent）
+  const targetTop =
+    el.getBoundingClientRect().top - listRect.top + listEl.scrollTop
+  listEl.scrollTo({ top: Math.max(0, targetTop), behavior: 'smooth' })
 }
 
 function triggerClean() {
@@ -431,7 +469,7 @@ onMounted(async () => {
       <!-- 明细列表：按分类分组，每组一个标题（标题前为分组复选框），下挂该类结果。
            条件用 grouped.length（真正渲染出内容）而非 candidates.length，
            保证与底部操作条严格同步出现。 -->
-      <div v-if="grouped.length" class="list fill-list">
+      <div v-if="grouped.length" ref="listRef" class="list fill-list">
         <div
           v-for="grp in grouped"
           :key="grp.category"
@@ -616,8 +654,8 @@ onMounted(async () => {
         <p v-if="doneResult.skipped.length" class="muted">
           已拦截 {{ doneResult.skipped.length }} 项（受保护/目录）
         </p>
-        <p v-if="doneResult.errors.length" class="err">
-          {{ doneResult.errors.length }} 项失败：{{ doneResult.errors.join('；') }}
+        <p class="muted small">
+          部分被占用或试用中的垃圾文件会自动跳过
         </p>
       </template>
       <template #footer>
@@ -658,6 +696,10 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+.small {
+  font-size: calc(12px * var(--fs-scale));
+  line-height: 1.5;
 }
 .title-icon {
   flex-shrink: 0;
